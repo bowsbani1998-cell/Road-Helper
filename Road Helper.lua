@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.6")
+script_version("1.7")
 
-local VER = "1.6"
+local VER = "1.7"
 local LUA_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/main/Road%20Helper.lua"
 local note = { on = false, t = 0, msg = "" }
 
@@ -630,7 +630,7 @@ function applyUpdate()
             sampAddChatMessage("{FF5555}[Road Helper] Файл обновления не прошёл проверку версии", -1)
             return
         end
-        local target = getWorkingDirectory() .. "/RoadHelper.lua"
+        local target = getWorkingDirectory() .. "/Road Helper.lua"
         os.remove(target)
         local renamed = os.rename(tempPath, target)
         if renamed then
@@ -885,7 +885,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PushStyleColor(imgui.Col.TitleBg, V4(0.012, 0.035, 0.070, 1.00))
     imgui.PushStyleColor(imgui.Col.TitleBgActive, V4(0.020, 0.070, 0.135, 1.00))
 
-    imgui.Begin(u8"ROAD HELPER  |  v1.6", nil, imgui.WindowFlags.NoCollapse)
+    imgui.Begin(u8"ROAD HELPER  |  v1.7", nil, imgui.WindowFlags.NoCollapse)
 
     -- Левая навигация. Иконки рисуются линиями, поэтому не зависят от шрифта.
     imgui.BeginChild("##side", V2(sideW, 0), true)
@@ -908,7 +908,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.TextColored(V4(0.22, 0.70, 1.00, 1), u8"ROAD HELPER")
     imgui.SetCursorPosX(imgui.GetCursorPosX() + 8 * S)
     imgui.SetWindowFontScale(0.82)
-    imgui.TextDisabled(u8"Road Helper v1.6")
+    imgui.TextDisabled(u8"Road Helper v1.7")
     imgui.SetWindowFontScale(1.0)
     imgui.Spacing()
     imgui.Separator()
@@ -1043,7 +1043,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         -- Премиум Dark Neon: отдельные карточки с описаниями и предупреждениями.
         local function settingsCard(id, title, description, value, banWarning, onChanged)
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
-            imgui.BeginChild("##settings_card_" .. id, V2(-1, 100 * S), true)
+            imgui.BeginChild("##settings_card_" .. id, V2(-1, 112 * S), true)
             imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
             imgui.TextDisabled(u8(description))
             imgui.Spacing()
@@ -1065,14 +1065,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
             flipT, flipped = nil, false
         end)
 
-        imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
-        imgui.BeginChild("##settings_flip_delay", V2(-1, 76 * S), true)
-        imgui.TextColored(V4(0.20, 0.78, 1.00, 1.0), u8"ПАРАМЕТРЫ AUTOFLIP")
-        imgui.Text(u8"Задержка перед /domkrat (сек.)")
-        if imgui.SliderFloat("##fd", flipDelay, 0.1, 3.0, "%.2f") then mark() end
-        imgui.EndChild()
-        imgui.PopStyleColor()
-        imgui.Spacing()
+        -- Задержка AutoFlip оставлена внутренней (0.75 сек.), отдельный ползунок убран,
+        -- чтобы переключатель AutoFlip был доступен без прокрутки.
         imgui.TextDisabled(u8"Изменения сохраняются автоматически.")
         if imgui.Button(u8"СОХРАНИТЬ НАСТРОЙКИ", V2(-1, 40 * S)) then
             saveCfg()
@@ -1082,9 +1076,23 @@ imgui.OnFrame(function() return ui.open end, function(self)
     elseif ui.tab == 3 then
         imgui.TextDisabled(u8"НАСТРОЙКА РАСПОЛОЖЕНИЯ И РАЗМЕРА")
         imgui.Spacing()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"КНОПКА СТАРТ / СТОП")
-        if settingToggle("Показывать кнопку", showCtrl, "show_ctrl") then mark() end
+
+        local function buttonSettingsCard(id, title, description, enabled, toggleId)
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
+            imgui.BeginChild("##button_card_" .. id, V2(-1, 112 * S), true)
+            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
+            imgui.TextDisabled(u8(description))
+            imgui.Spacing()
+            if settingToggle("Включить", enabled, toggleId) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
+            imgui.Spacing()
+        end
+
+        buttonSettingsCard("control", "КНОПКА СТАРТ / СТОП", "Показывать плавающую кнопку управления работой.", showCtrl, "show_ctrl")
         if showCtrl[0] then
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
+            imgui.BeginChild("##button_control_values", V2(-1, 150 * S), true)
             imgui.Text(u8"Положение X")
             if imgui.SliderInt("##cpx", ctrlX, 0, math.max(0, sizeX - 50)) then mark() end
             imgui.Text(u8"Положение Y")
@@ -1093,13 +1101,15 @@ imgui.OnFrame(function() return ui.open end, function(self)
             if imgui.SliderInt("##cw", ctrlW, 100, 300) then mark() end
             imgui.Text(u8"Высота")
             if imgui.SliderInt("##ch", ctrlH, 36, 80) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
         end
 
         imgui.Spacing()
-        imgui.Separator()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"КНОПКА МЕСТА РЕМОНТА")
-        if settingToggle("Показывать кнопку МЕСТА", showRep, "show_rep") then mark() end
+        buttonSettingsCard("repairs", "КНОПКА МЕСТА РЕМОНТА", "Показывать плавающую кнопку быстрого доступа к местам ремонта.", showRep, "show_rep")
         if showRep[0] then
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
+            imgui.BeginChild("##button_repairs_values", V2(-1, 150 * S), true)
             imgui.Text(u8"Положение X")
             if imgui.SliderInt("##rpx", repX, 0, math.max(0, sizeX - 50)) then mark() end
             imgui.Text(u8"Положение Y")
@@ -1108,9 +1118,11 @@ imgui.OnFrame(function() return ui.open end, function(self)
             if imgui.SliderInt("##rw", repW, 100, 300) then mark() end
             imgui.Text(u8"Высота")
             if imgui.SliderInt("##rh", repH, 36, 80) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
         end
         imgui.Spacing()
-        imgui.TextDisabled(u8"Зажми кнопку на 0.4 сек. и перетащи пальцем.")
+        imgui.TextDisabled(u8"Зажми плавающую кнопку на 0.4 сек. и перетащи пальцем.")
         if imgui.Button(u8"СОХРАНИТЬ ПОЛОЖЕНИЕ КНОПОК", V2(-1, 40 * S)) then
             saveCfg()
             sampAddChatMessage("{00BFFF}[Road Helper] Кнопки сохранены", -1)
@@ -1119,34 +1131,61 @@ imgui.OnFrame(function() return ui.open end, function(self)
     elseif ui.tab == 4 then
         imgui.TextDisabled(u8"РЕЗУЛЬТАТЫ ТЕКУЩЕЙ РАБОТЫ")
         imgui.Spacing()
-        if settingToggle("Показывать отдельное окно статистики", showStats, "show_stats") then mark() end
+
+        local function statToggleCard(id, title, description, value)
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
+            imgui.BeginChild("##stat_card_" .. id, V2(-1, 112 * S), true)
+            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
+            imgui.TextDisabled(u8(description))
+            imgui.Spacing()
+            if settingToggle("Включить", value, id) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
+            imgui.Spacing()
+        end
+
+        statToggleCard("show_stats", "ОКНО СТАТИСТИКИ", "Показывать отдельное плавающее окно статистики.", showStats)
         if showStats[0] then
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
+            imgui.BeginChild("##stat_dimensions", V2(-1, 86 * S), true)
             imgui.Text(u8"Ширина окна")
             if imgui.SliderInt("##sw", statW, 180, 360) then mark() end
             imgui.Text(u8"Высота окна")
             if imgui.SliderInt("##sh", statH, 100, 300) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
         end
-        imgui.Separator()
-        if settingToggle("Показывать время", visTime, "vis_time") then mark() end
-        if settingToggle("Показывать деньги", visMoney, "vis_money") then mark() end
-        if settingToggle("Показывать количество Frame", visFrame, "vis_frame") then mark() end
-        if settingToggle("Показывать ларцы", visChests, "vis_chests") then mark() end
-        if settingToggle("Показывать общий заработок", visTotal, "vis_total") then mark() end
-        imgui.Spacing()
-        imgui.Text(u8"Цена одного Frame ($)")
+
+        statToggleCard("vis_time", "ВРЕМЯ РАБОТЫ", "Отображать продолжительность текущей работы.", visTime)
+        statToggleCard("vis_money", "ДЕНЬГИ С СИСТЕМЫ", "Отображать заработок, полученный от системы.", visMoney)
+        statToggleCard("vis_frame", "КОЛИЧЕСТВО FRAME", "Отображать количество полученных кейсов Frame.", visFrame)
+        statToggleCard("vis_chests", "КОЛИЧЕСТВО ЛАРЦОВ", "Отображать общее количество распознанных ларцов.", visChests)
+        statToggleCard("vis_total", "ОБЩИЙ ЗАРАБОТОК", "Отображать сумму системного заработка и стоимости Frame.", visTotal)
+
+        imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
+        imgui.BeginChild("##stat_price_card", V2(-1, 78 * S), true)
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ЦЕНА ОДНОГО FRAME ($)")
         imgui.PushItemWidth(-1)
         if imgui.InputInt("##cp", casePrice, 100000, 1000000) then
             if casePrice[0] < 0 then casePrice[0] = 0 end
             mark()
         end
         imgui.PopItemWidth()
+        imgui.EndChild()
+        imgui.PopStyleColor()
+
         imgui.Spacing()
+        imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
+        imgui.BeginChild("##stat_summary_card", V2(-1, 154 * S), true)
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"СВОДКА")
         imgui.Text(u8"Время работы:  " .. fmtTime(workSec()))
         imgui.Text(u8"Деньги с системы:  " .. fmtMoney(st.money))
         imgui.Text(u8"Количество Frame:  " .. tostring(st.frame))
         if visChests[0] then imgui.Text(u8"Ларцы:  " .. tostring(st.chests)) end
         imgui.Separator()
         imgui.TextColored(V4(0.18, 0.92, 0.62, 1), u8"ОБЩИЙ ЗАРАБОТОК:  " .. fmtMoney(totalMoney()))
+        imgui.EndChild()
+        imgui.PopStyleColor()
         imgui.Spacing()
         if imgui.Button(u8"СБРОСИТЬ СТАТИСТИКУ", V2(-1, 40 * S)) then
             st.clicks, st.money, st.frame, st.chests = 0, 0, 0, 0
@@ -1159,7 +1198,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     elseif ui.tab == 5 then
         imgui.TextDisabled(u8"ИНФОРМАЦИЯ О ПРОЕКТЕ")
         imgui.Spacing()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ROAD HELPER v1.6")
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ROAD HELPER v1.7")
         imgui.Text(u8"Версия: " .. VER)
         imgui.Text(u8"Автор: Bows")
         imgui.Text(u8"Платформа: Android / NeomLoader")
@@ -1355,9 +1394,9 @@ function main()
     while not isSampAvailable() do wait(100) end
     loadCfg()
     loadRoadIcons()
-    log("load 1.6 with external icons")
+    log("load 1.7 with external icons")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.6", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.7", -1)
     lua_thread.create(function()
         wait(8000)
         checkUpdate(true)
