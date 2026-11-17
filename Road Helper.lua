@@ -1,9 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.7")
+script_version("1.8")
 
-local VER = "1.7"
-local LUA_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/main/Road%20Helper.lua"
+local VER = "1.8"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -22,12 +21,15 @@ local cfgPath = getWorkingDirectory() .. "/RoadHelper_config.ini"
 local function log(_) end
 
 local ui = { open = false, tab = 1 }
+local touchScroll = { down = false, lastY = 0 }
 
 local autoClick   = new.bool(true)
 local autoTool    = new.bool(false)
 local autoCaptcha = new.bool(true)
 local autoRepairs = new.bool(true)
 local autoFlip    = new.bool(true)
+local autoLock    = new.bool(false)
+local autoFill    = new.bool(false)
 local flipDelay   = new.float(0.75)
 
 local showCtrl  = new.bool(true)
@@ -44,8 +46,8 @@ local repY = new.int(math.floor(sizeY / 2 + 40))
 local repW = new.int(180)
 local repH = new.int(48)
 
-local statW = new.int(240)
-local statH = new.int(150)
+local statW = new.int(350)
+local statH = new.int(280)
 
 local visTime   = new.bool(true)
 local visMoney  = new.bool(true)
@@ -57,6 +59,12 @@ local casePrice = new.int(5000000)
 
 local working = false
 local clicker = false
+local autoFillGeneration = 0
+local gasState = { gasType = nil, maxGas = nil, currentGas = nil }
+
+local function featureOn(flag)
+    return working and flag ~= nil and flag[0] == true
+end
 local trunk = false
 local t0 = 0
 local lastMoney = -1
@@ -177,6 +185,8 @@ local function saveCfg()
         f:write("autoCaptcha=" .. b(autoCaptcha[0]) .. "\n")
         f:write("autoRepairs=" .. b(autoRepairs[0]) .. "\n")
         f:write("autoFlip=" .. b(autoFlip[0]) .. "\n")
+        f:write("autoLock=" .. b(autoLock[0]) .. "\n")
+        f:write("autoFill=" .. b(autoFill[0]) .. "\n")
         f:write("flipDelay=" .. tostring(flipDelay[0]) .. "\n")
         f:write("casePrice=" .. casePrice[0] .. "\n")
         f:write("money=" .. st.money .. "\n")
@@ -226,6 +236,8 @@ local function loadCfg()
                 elseif k == "autoCaptcha" then autoCaptcha[0] = on
                 elseif k == "autoRepairs" then autoRepairs[0] = on
                 elseif k == "autoFlip" then autoFlip[0] = on
+                elseif k == "autoLock" then autoLock[0] = on
+                elseif k == "autoFill" then autoFill[0] = on
                 elseif k == "flipDelay" and n then flipDelay[0] = math.max(0.1, math.min(3, n))
                 elseif k == "casePrice" and n then casePrice[0] = n
                 elseif k == "money" and n then st.money = n
@@ -260,11 +272,15 @@ local function loadCfg()
                 elseif k == "auto_captcha" then autoCaptcha[0] = on
                 elseif k == "auto_open_repairs" then autoRepairs[0] = on
                 elseif k == "auto_flip" then autoFlip[0] = on
+                elseif k == "auto_lock" then autoLock[0] = on
+                elseif k == "auto_fill" then autoFill[0] = on
                 elseif k == "flip_delay" and n then flipDelay[0] = math.max(0.1, math.min(3, n))
                 end
             end
         end
         f:close()
+        statW[0] = math.max(280, math.min(480, statW[0]))
+        statH[0] = math.max(260, math.min(380, statH[0]))
         log("cfg ok")
     end)
 end
@@ -284,6 +300,8 @@ local function setWork(on)
     else
         log("stop")
         clicker = false
+        autoFillGeneration = autoFillGeneration + 1
+        gasState = { gasType = nil, maxGas = nil, currentGas = nil }
         saveCfg()
         sampAddChatMessage("{FF5555}[Road Helper] Остановлен", -1)
     end
@@ -332,6 +350,107 @@ function sendLoaded(iid, on)
     raknetDeleteBitStream(bs)
 end
 
+-- Arizona gas-station frontend protocol (integrated AutoFill).
+local GAS_INTERFACE_ID = 48
+
+local function sendGasInterfaceState(interfaceId, state)
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 66)
+    raknetBitStreamWriteInt8(bs, interfaceId)
+    raknetBitStreamWriteBool(bs, state and true or false)
+    raknetSendBitStreamEx(bs, 1, 10, 1)
+    raknetDeleteBitStream(bs)
+end
+
+local function sendGasFrontendClick(interfaceId, elementId, subId, json)
+    json = json or ""
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 63)
+    raknetBitStreamWriteInt8(bs, interfaceId)
+    raknetBitStreamWriteInt32(bs, elementId)
+    raknetBitStreamWriteInt32(bs, subId)
+    raknetBitStreamWriteInt16(bs, #json)
+    raknetBitStreamWriteString(bs, json)
+    raknetSendBitStreamEx(bs, 1, 10, 1)
+    raknetDeleteBitStream(bs)
+end
+
+local function sendGasInteraction()
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 63)
+    raknetBitStreamWriteInt8(bs, 8)
+    raknetBitStreamWriteInt32(bs, 7)
+    raknetBitStreamWriteInt32(bs, -1)
+    raknetBitStreamWriteInt16(bs, 0)
+    raknetBitStreamWriteString(bs, "")
+    raknetSendBitStreamEx(bs, 1, 7, 1)
+    raknetDeleteBitStream(bs)
+end
+
+local function tryAutoFill(generation)
+    if not featureOn(autoFill) or generation ~= autoFillGeneration then return end
+    local gasType, maxGas, currentGas = gasState.gasType, gasState.maxGas, gasState.currentGas
+    if not gasType or not maxGas or not currentGas then return end
+    local amount = maxGas - currentGas
+    if amount <= 0 then
+        gasState = { gasType = nil, maxGas = nil, currentGas = nil }
+        return
+    end
+    local json = string.format("%d,%d", tonumber(gasType.id) or 0, amount)
+    sendGasFrontendClick(GAS_INTERFACE_ID, -1, 0, json)
+    sampAddChatMessage("{00BFFF}[Road Helper] Автофулл: заправка запущена", -1)
+    gasState = { gasType = nil, maxGas = nil, currentGas = nil }
+end
+
+local function handleGasFrontend(interfaceId, subId, payload)
+    if not featureOn(autoFill) then return end
+    if interfaceId == GAS_INTERFACE_ID then
+        if subId == 0 then
+            local ok, types = pcall(decodeJson, payload)
+            if ok and type(types) == "table" then
+                gasState.gasType = nil
+                for _, item in ipairs(types) do
+                    if tonumber(item.available) == 1 then
+                        gasState.gasType = item
+                        break
+                    end
+                end
+            end
+        elseif subId == 2 then
+            gasState.maxGas = tonumber(payload)
+        elseif subId == 3 then
+            gasState.currentGas = tonumber(payload)
+            local generation = autoFillGeneration
+            lua_thread.create(function()
+                wait(100)
+                tryAutoFill(generation)
+            end)
+        end
+    elseif interfaceId == 8 and subId == 15 then
+        local ok, data = pcall(decodeJson, payload)
+        if ok and type(data) == "table" then
+            local title = tostring(data.title or "")
+            local lowerTitle = string.lower(title)
+            if string.find(title, "Заправ", 1, true)
+                or string.find(lowerTitle, "заправ", 1, true)
+                or string.find(lowerTitle, "gas", 1, true)
+                or string.find(lowerTitle, "fuel", 1, true)
+                or string.find(lowerTitle, "refuel", 1, true) then
+                local generation = autoFillGeneration
+                lua_thread.create(function()
+                    wait(50)
+                    if featureOn(autoFill) and generation == autoFillGeneration then
+                        sendGasInteraction()
+                    end
+                end)
+            end
+        end
+    end
+end
+
 function tap()
     sendClickIface(25, 0, 0, "")
     sendCef("clickMinigame")
@@ -373,16 +492,18 @@ function onReceivePacket(id, bs)
             clicker = false
         end
 
-        if autoCaptcha[0] and working then
+        if featureOn(autoCaptcha) then
             if string.find(cmd, "FindGame", 1, true) or string.find(cmd, "findGame", 1, true) then
                 log("findgame")
                 lua_thread.create(function()
                     wait(150)
+                    if not featureOn(autoCaptcha) then return end
                     for i = 1, 6 do
+                        if not featureOn(autoCaptcha) then return end
                         sendCef("findGame.Success")
                         wait(180)
                     end
-                    sendCef("findGame.finish")
+                    if featureOn(autoCaptcha) then sendCef("findGame.finish") end
                 end)
             end
         end
@@ -404,6 +525,20 @@ function onReceivePacket(id, bs)
             log("clicker on")
         end
 
+        -- Frontend payload for AutoFill: length, encoding flag, JSON/text body.
+        local okPayload, payload = pcall(function()
+            local len = raknetBitStreamReadInt16(bs)
+            local encoded = raknetBitStreamReadInt8(bs)
+            if not len or len < 0 or len > 32760 then return nil end
+            if encoded ~= 0 then
+                return raknetBitStreamDecodeString(bs, len + encoded)
+            end
+            return raknetBitStreamReadString(bs, len)
+        end)
+        if okPayload and payload then
+            handleGasFrontend(iid, sub, tostring(payload))
+        end
+
     elseif p == 62 then
         local iid = raknetBitStreamReadInt8(bs)
         local on = raknetBitStreamReadBool(bs)
@@ -413,6 +548,10 @@ function onReceivePacket(id, bs)
         if iid == 101 then
             trunk = on and true or false
             log(on and "TRUNK OPEN" or "TRUNK CLOSE")
+        end
+        if iid == GAS_INTERFACE_ID and featureOn(autoFill) then
+            sendGasInterfaceState(iid, on)
+            return false
         end
 
         if iid == 25 then
@@ -426,16 +565,19 @@ function onReceivePacket(id, bs)
             end
         end
 
-        if iid == 81 and on and autoCaptcha[0] and working then
+        if iid == 81 and on and featureOn(autoCaptcha) then
             log("cap on")
             lua_thread.create(function()
                 wait(120)
+                if not featureOn(autoCaptcha) then return end
                 sendLoaded(81, true)
                 for cell = 0, 24 do
+                    if not featureOn(autoCaptcha) then return end
                     sendClickIface(81, cell, 0, "")
                     wait(40)
                 end
                 for i = 1, 8 do
+                    if not featureOn(autoCaptcha) then return end
                     sendClickIface(81, 0, 0, "")
                     wait(60)
                 end
@@ -490,162 +632,92 @@ local function has(s, a, b)
     return false
 end
 
+local pendingLoot = nil
+
 local function qty(s)
-    local n = tonumber(tostring(s):match("%((%d+)")) or 1
+    local n = tonumber(tostring(s or ""):match("%((%d+)")) or 1
     if n < 1 then n = 1 end
     if n > 50 then n = 50 end
     return n
 end
 
-local function addChests(clean)
-    local low = string.lower(tostring(clean or ""))
-    if string.find(low, "frame", 1, true) then return end
-    local box = string.find(low, "ларц", 1, true)
-        or string.find(low, "ящик", 1, true)
-        or string.find(low, "box", 1, true)
-        or string.find(low, "кейс", 1, true)
-        or string.find(low, "сундук", 1, true)
-    if not box then return end
-    local received = string.find(low, "добавлен", 1, true)
-        or string.find(low, "получ", 1, true)
-        or string.find(low, "выпал", 1, true)
-        or string.find(low, "выдан", 1, true)
-        or string.find(low, "storage", 1, true)
-        or string.find(low, "хранилищ", 1, true)
-        or string.find(low, "инвентар", 1, true)
-    if not received then return end
-    local n = qty(clean)
-    st.chests = st.chests + n
-    mark()
-    log("chest +" .. n .. " =" .. st.chests)
+local function isFrameMsg(s)
+    return string.find(s, "Frame", 1, true) or string.find(s, "frame", 1, true)
 end
 
+local function isStorageMsg(s)
+    return string.find(s, "storage", 1, true)
+        or string.find(s, "Storage", 1, true)
+        or string.find(s, "/storage", 1, true)
+end
+
+local function hasQty(s)
+    return string.find(s, "%(%d+") ~= nil
+end
+
+local function addFrame(n)
+    st.frame = st.frame + n
+    mark()
+    log("frame +" .. tostring(n) .. " =" .. tostring(st.frame))
+    sampAddChatMessage("{00BFFF}[Road Helper] Frame +" .. n .. " (" .. st.frame .. ")", -1)
+end
+
+local function addOther(n)
+    st.chests = st.chests + n
+    mark()
+    log("chest +" .. tostring(n) .. " =" .. tostring(st.chests))
+    sampAddChatMessage("{00BFFF}[Road Helper] Ларец +" .. n .. " (" .. st.chests .. ")", -1)
+end
+
+-- Только ASCII: storage / Frame / (N — не зависит от CP1251/UTF-8.
+-- Если предмет и /storage на разных строках — ждём до 3 сек.
 function onServerMessage(color, text)
     if not text then return end
     local clean = tostring(text):gsub("{%x%x%x%x%x%x}", "")
 
-    if has(clean, "Frame", "frame") then
-        if has(clean, "добавлен", "Добавлен")
-            or has(clean, "получили", "Получили")
-            or has(clean, "storage", "Storage")
-            or has(clean, "выпал", "Выпал")
-            or has(clean, "получен", "Получен")
-        then
-            local n = qty(clean)
-            st.frame = st.frame + n
-            mark()
-            log("frame +" .. n .. " =" .. st.frame)
-            sampAddChatMessage("{00BFFF}[Road Helper] Frame +" .. n .. " (" .. st.frame .. ")", -1)
+    if isStorageMsg(clean) and pendingLoot and (os.clock() - pendingLoot.t) <= 3 then
+        if pendingLoot.isFrame then
+            addFrame(pendingLoot.n)
+        else
+            addOther(pendingLoot.n)
         end
-    else
-        addChests(clean)
+        pendingLoot = nil
+    end
+
+    if isFrameMsg(clean) then
+        if isStorageMsg(clean) and hasQty(clean) then
+            addFrame(qty(clean))
+        elseif hasQty(clean) then
+            pendingLoot = { n = qty(clean), t = os.clock(), isFrame = true }
+        elseif isStorageMsg(clean) then
+            addFrame(1)
+        end
+    elseif isStorageMsg(clean) and hasQty(clean) then
+        addOther(qty(clean))
+    elseif hasQty(clean) and not isFrameMsg(clean) and #clean >= 20 then
+        local n = qty(clean)
+        if n >= 1 and n <= 20 then
+            pendingLoot = { n = n, t = os.clock(), isFrame = false }
+        end
     end
 
     local low = string.lower(clean)
     if string.find(low, "/repairs", 1, true)
-        or has(clean, "новые ямы", "Новые ямы")
-        or has(clean, "образовались новые", "Образовались новые")
+        or string.find(clean, "новые ямы", 1, true)
+        or string.find(clean, "Новые ямы", 1, true)
+        or string.find(clean, "образовались новые", 1, true)
+        or string.find(clean, "Образовались новые", 1, true)
     then
         log("pits")
-        if autoRepairs[0] then
+        if featureOn(autoRepairs) then
             lua_thread.create(function()
                 wait(300)
-                openRepairs()
+                if featureOn(autoRepairs) then openRepairs() end
             end)
         end
     end
 end
 
-local updBusy = false
-
-local function verNum(s)
-    local a, b = tostring(s):match("(%d+)%.(%d+)")
-    return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
-end
-
-local function pullFile(url, path, done)
-    if not url or url == "" then
-        sampAddChatMessage("{FF5555}[Road Helper] Ссылка GitHub не задана", -1)
-        return
-    end
-    if type(downloadUrlToFile) ~= "function" then
-        sampAddChatMessage("{FF5555}[Road Helper] Загрузка в этом лоадере недоступна", -1)
-        return
-    end
-    if updBusy then return end
-    updBusy = true
-    lua_thread.create(function()
-        local started = pcall(function()
-            downloadUrlToFile(url, path, function(_, status)
-                updBusy = false
-                if done then done(status == 200 or status == 0, status) end
-            end)
-        end)
-        if not started then
-            updBusy = false
-            if done then done(false, -1) end
-        end
-    end)
-end
-
-function checkUpdate(silent)
-    local tempPath = getWorkingDirectory() .. "/RoadHelper_update_check.tmp"
-    pullFile(LUA_URL, tempPath, function(ok)
-        if not ok then
-            if not silent then sampAddChatMessage("{FF5555}[Road Helper] Не удалось проверить GitHub", -1) end
-            return
-        end
-        local f = io.open(tempPath, "r")
-        local remoteText = ""
-        if f then remoteText = f:read("*a") or ""; f:close() end
-        os.remove(tempPath)
-        local remote = remoteText:match('script_version%s*%(%s*["\']([%d%.]+)["\']%s*%)')
-        if not remote then
-            if not silent then sampAddChatMessage("{FF5555}[Road Helper] Не удалось прочитать версию GitHub", -1) end
-            return
-        end
-        if verNum(remote) > verNum(VER) then
-            note.on = true
-            note.msg = "Доступно обновление Road Helper v" .. remote
-            note.remote = remote
-        elseif not silent then
-            sampAddChatMessage("{00FF00}[Road Helper] Установлена последняя версия v" .. VER, -1)
-        end
-    end)
-end
-
-function applyUpdate()
-    local tempPath = getWorkingDirectory() .. "/RoadHelper_update.lua"
-    pullFile(LUA_URL, tempPath, function(ok)
-        if not ok then
-            sampAddChatMessage("{FF5555}[Road Helper] Не удалось скачать обновление", -1)
-            return
-        end
-        local f = io.open(tempPath, "r")
-        local body = ""
-        if f then body = f:read("*a") or ""; f:close() end
-        local remote = body:match('script_version%s*%(%s*["\']([%d%.]+)["\']%s*%)')
-        if not remote or verNum(remote) <= verNum(VER) then
-            os.remove(tempPath)
-            sampAddChatMessage("{FF5555}[Road Helper] Файл обновления не прошёл проверку версии", -1)
-            return
-        end
-        local target = getWorkingDirectory() .. "/Road Helper.lua"
-        os.remove(target)
-        local renamed = os.rename(tempPath, target)
-        if renamed then
-            note.on = false
-            sampAddChatMessage("{00FF00}[Road Helper] Обновление v" .. remote .. " скачано. Перезапусти скрипт", -1)
-        else
-            sampAddChatMessage("{FF5555}[Road Helper] Не удалось сохранить файл обновления", -1)
-        end
-    end)
-end
-
-function showNote(msg)
-    note.on = true
-    note.msg = tostring(msg or "")
-end
 
 local function drawDigger(dl, x, y, s)
     local function ln(x1, y1, x2, y2)
@@ -795,10 +867,9 @@ end
 
 -- Neоновые переключатели настроек (вместо стандартных Checkbox)
 local function settingToggle(label, value, id, banWarning)
-    local avail = imgui.GetContentRegionAvail()
-    imgui.Text(u8(label))
+    if label and label ~= "" then imgui.Text(u8(label)) end
     if banWarning then
-        imgui.SameLine()
+        if label and label ~= "" then imgui.SameLine() end
         imgui.PushStyleColor(imgui.Col.Button, V4(0.55, 0.035, 0.055, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.68, 0.045, 0.065, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.42, 0.025, 0.04, 1.0))
@@ -807,7 +878,8 @@ local function settingToggle(label, value, id, banWarning)
         imgui.PopStyleColor(4)
     end
     local w, h = 50 * S, 27 * S
-    imgui.SetCursorPosX((imgui.GetWindowWidth() - w) * 0.5)
+    local avail = imgui.GetContentRegionAvail()
+    imgui.SetCursorPosX(math.max(0, avail.x - w))
     local clicked = imgui.Button("##rh_toggle_" .. id, V2(w, h))
     if clicked then value[0] = not value[0] end
 
@@ -868,6 +940,9 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 16 * S)
     imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 12 * S)
     imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 9 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.GrabRounding, 12 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.GrabMinSize, 18 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.ScrollbarSize, 6.93 * S)
     imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(10 * S, 10 * S))
     imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing, V2(7 * S, 7 * S))
 
@@ -878,20 +953,23 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.025, 0.310, 0.560, 1.00))
     imgui.PushStyleColor(imgui.Col.FrameBg, V4(0.030, 0.085, 0.145, 1.00))
     imgui.PushStyleColor(imgui.Col.CheckMark, V4(0.12, 0.68, 1.00, 1.00))
-    imgui.PushStyleColor(imgui.Col.SliderGrab, V4(0.08, 0.58, 0.95, 1.00))
+    imgui.PushStyleColor(imgui.Col.SliderGrab, V4(0.05, 0.78, 0.92, 1.00))
+    imgui.PushStyleColor(imgui.Col.SliderGrabActive, V4(0.25, 0.94, 1.00, 1.00))
+    imgui.PushStyleColor(imgui.Col.FrameBgHovered, V4(0.045, 0.19, 0.29, 1.00))
     imgui.PushStyleColor(imgui.Col.Text, V4(0.90, 0.95, 1.00, 1.00))
     imgui.PushStyleColor(imgui.Col.TextDisabled, V4(0.43, 0.58, 0.73, 1.00))
     imgui.PushStyleColor(imgui.Col.Border, V4(0.08, 0.30, 0.52, 0.85))
     imgui.PushStyleColor(imgui.Col.TitleBg, V4(0.012, 0.035, 0.070, 1.00))
     imgui.PushStyleColor(imgui.Col.TitleBgActive, V4(0.020, 0.070, 0.135, 1.00))
 
-    imgui.Begin(u8"ROAD HELPER  |  v1.7", nil, imgui.WindowFlags.NoCollapse)
+    imgui.Begin(u8"##road_helper_main", nil, imgui.WindowFlags.NoCollapse)
 
     -- Левая навигация. Иконки рисуются линиями, поэтому не зависят от шрифта.
     imgui.BeginChild("##side", V2(sideW, 0), true)
     local side = imgui.GetWindowDrawList()
     local sp = imgui.GetCursorScreenPos()
     local avail = imgui.GetContentRegionAvail()
+    imgui.Dummy(V2(1, 3 * S))
     local logoW = math.min(132 * S, avail.x - 8)
     local logoH = logoW * 0.66
     if logoTexture then
@@ -903,12 +981,11 @@ imgui.OnFrame(function() return ui.open end, function(self)
     end
     imgui.Dummy(V2(1, 5 * S))
 
-    imgui.SetCursorPosX(imgui.GetCursorPosX() + 8 * S)
-    imgui.SetWindowFontScale(1.08)
-    imgui.TextColored(V4(0.22, 0.70, 1.00, 1), u8"ROAD HELPER")
-    imgui.SetCursorPosX(imgui.GetCursorPosX() + 8 * S)
     imgui.SetWindowFontScale(0.82)
-    imgui.TextDisabled(u8"Road Helper v1.7")
+    local sideText = u8"Road Helper v1.3"
+    local sideTextW = imgui.CalcTextSize(sideText).x
+    imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
+    imgui.TextDisabled(sideText)
     imgui.SetWindowFontScale(1.0)
     imgui.Spacing()
     imgui.Separator()
@@ -946,6 +1023,26 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
     imgui.SameLine()
     imgui.BeginChild("##body", V2(0, 0), true)
+
+    -- Touch scrolling: drag vertically anywhere in the content area, not only the scrollbar.
+    local io = imgui.GetIO()
+    local mouseDown = io.MouseDown[0]
+    local mouseY = io.MousePos.y
+    local hovered = imgui.IsWindowHovered()
+    if mouseDown and hovered and not imgui.IsAnyItemActive() then
+        if not touchScroll.down then
+            touchScroll.down = true
+            touchScroll.lastY = mouseY
+        else
+            local dy = mouseY - touchScroll.lastY
+            if math.abs(dy) > 0 then
+                imgui.SetScrollY(math.max(0, imgui.GetScrollY() - dy * 1.10))
+                touchScroll.lastY = mouseY
+            end
+        end
+    else
+        touchScroll.down = false
+    end
 
     local headers = {
         u8"ПАНЕЛЬ УПРАВЛЕНИЯ",
@@ -1037,19 +1134,25 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         imgui.Spacing()
         imgui.TextDisabled(u8"Цена одного Frame: " .. fmtMoney(casePrice[0]))
-        imgui.TextDisabled(u8"Другие ларцы не учитываются — статистика считает только Frame.")
+        imgui.TextDisabled(u8"Учитываются ларцы и кейсы из уведомлений хранилища.")
 
     elseif ui.tab == 2 then
         -- Премиум Dark Neon: отдельные карточки с описаниями и предупреждениями.
         local function settingsCard(id, title, description, value, banWarning, onChanged)
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
-            imgui.BeginChild("##settings_card_" .. id, V2(-1, 112 * S), true)
+            imgui.BeginChild("##settings_card_" .. id, V2(-1, 92 * S), true)
+            local cardW = imgui.GetContentRegionAvail().x
+            imgui.BeginChild("##settings_info_" .. id, V2(cardW * 0.70, -1), false)
             imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
             imgui.TextDisabled(u8(description))
-            imgui.Spacing()
-            if settingToggle("Включить", value, id, banWarning) then
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##settings_switch_" .. id, V2(0, -1), false)
+            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
+            if settingToggle("", value, id, banWarning) then
                 if onChanged then onChanged() else mark() end
             end
+            imgui.EndChild()
             imgui.EndChild()
             imgui.PopStyleColor()
             imgui.Spacing()
@@ -1064,6 +1167,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
             mark()
             flipT, flipped = nil, false
         end)
+        settingsCard("auto_lock", "АВТО ЛОК", "Закрывает автомобиль и выполняет команды при посадке/выходе.", autoLock, false)
+        settingsCard("auto_fill", "АВТОФУЛЛ", "Автоматически заправляет автомобиль на АЗС.", autoFill, false)
 
         -- Задержка AutoFlip оставлена внутренней (0.75 сек.), отдельный ползунок убран,
         -- чтобы переключатель AutoFlip был доступен без прокрутки.
@@ -1079,11 +1184,17 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         local function buttonSettingsCard(id, title, description, enabled, toggleId)
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
-            imgui.BeginChild("##button_card_" .. id, V2(-1, 112 * S), true)
+            imgui.BeginChild("##button_card_" .. id, V2(-1, 92 * S), true)
+            local cardW = imgui.GetContentRegionAvail().x
+            imgui.BeginChild("##button_info_" .. id, V2(cardW * 0.70, -1), false)
             imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
             imgui.TextDisabled(u8(description))
-            imgui.Spacing()
-            if settingToggle("Включить", enabled, toggleId) then mark() end
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##button_switch_" .. id, V2(0, -1), false)
+            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
+            if settingToggle("", enabled, toggleId) then mark() end
+            imgui.EndChild()
             imgui.EndChild()
             imgui.PopStyleColor()
             imgui.Spacing()
@@ -1134,11 +1245,17 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         local function statToggleCard(id, title, description, value)
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.075, 0.125, 0.185, 1.0))
-            imgui.BeginChild("##stat_card_" .. id, V2(-1, 112 * S), true)
+            imgui.BeginChild("##stat_card_" .. id, V2(-1, 92 * S), true)
+            local cardW = imgui.GetContentRegionAvail().x
+            imgui.BeginChild("##stat_info_" .. id, V2(cardW * 0.70, -1), false)
             imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
             imgui.TextDisabled(u8(description))
-            imgui.Spacing()
-            if settingToggle("Включить", value, id) then mark() end
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##stat_switch_" .. id, V2(0, -1), false)
+            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
+            if settingToggle("", value, id) then mark() end
+            imgui.EndChild()
             imgui.EndChild()
             imgui.PopStyleColor()
             imgui.Spacing()
@@ -1149,9 +1266,9 @@ imgui.OnFrame(function() return ui.open end, function(self)
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
             imgui.BeginChild("##stat_dimensions", V2(-1, 86 * S), true)
             imgui.Text(u8"Ширина окна")
-            if imgui.SliderInt("##sw", statW, 180, 360) then mark() end
+            if imgui.SliderInt("##sw", statW, 280, 480) then mark() end
             imgui.Text(u8"Высота окна")
-            if imgui.SliderInt("##sh", statH, 100, 300) then mark() end
+            if imgui.SliderInt("##sh", statH, 260, 380) then mark() end
             imgui.EndChild()
             imgui.PopStyleColor()
         end
@@ -1159,7 +1276,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         statToggleCard("vis_time", "ВРЕМЯ РАБОТЫ", "Отображать продолжительность текущей работы.", visTime)
         statToggleCard("vis_money", "ДЕНЬГИ С СИСТЕМЫ", "Отображать заработок, полученный от системы.", visMoney)
         statToggleCard("vis_frame", "КОЛИЧЕСТВО FRAME", "Отображать количество полученных кейсов Frame.", visFrame)
-        statToggleCard("vis_chests", "КОЛИЧЕСТВО ЛАРЦОВ", "Отображать общее количество распознанных ларцов.", visChests)
+        statToggleCard("vis_chests", "ДРУГИЕ ЛАРЦЫ И КЕЙСЫ", "Считать полученные ларцы и кейсы, кроме Frame.", visChests)
         statToggleCard("vis_total", "ОБЩИЙ ЗАРАБОТОК", "Отображать сумму системного заработка и стоимости Frame.", visTotal)
 
         imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.055, 0.105, 0.16, 1.0))
@@ -1181,7 +1298,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Text(u8"Время работы:  " .. fmtTime(workSec()))
         imgui.Text(u8"Деньги с системы:  " .. fmtMoney(st.money))
         imgui.Text(u8"Количество Frame:  " .. tostring(st.frame))
-        if visChests[0] then imgui.Text(u8"Ларцы:  " .. tostring(st.chests)) end
+        if visChests[0] then imgui.Text(u8"Другие ларцы и кейсы:  " .. tostring(st.chests)) end
         imgui.Separator()
         imgui.TextColored(V4(0.18, 0.92, 0.62, 1), u8"ОБЩИЙ ЗАРАБОТОК:  " .. fmtMoney(totalMoney()))
         imgui.EndChild()
@@ -1198,55 +1315,19 @@ imgui.OnFrame(function() return ui.open end, function(self)
     elseif ui.tab == 5 then
         imgui.TextDisabled(u8"ИНФОРМАЦИЯ О ПРОЕКТЕ")
         imgui.Spacing()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ROAD HELPER v1.7")
         imgui.Text(u8"Версия: " .. VER)
         imgui.Text(u8"Автор: Bows")
         imgui.Text(u8"Платформа: Android / NeomLoader")
         imgui.Spacing()
         imgui.Separator()
-        imgui.TextDisabled(u8"Обновления проверяются через GitHub.")
-        if imgui.Button(u8"ПРОВЕРИТЬ ОБНОВЛЕНИЕ", V2(-1, 42 * S)) then
-            checkUpdate(false)
-        end
-        if imgui.Button(u8"УСТАНОВИТЬ ОБНОВЛЕНИЕ", V2(-1, 42 * S)) then
-            applyUpdate()
-        end
     end
 
     imgui.EndChild()
     imgui.End()
-    imgui.PopStyleColor(13)
-    imgui.PopStyleVar(5)
+    imgui.PopStyleColor(15)
+    imgui.PopStyleVar(8)
 end)
 
-
-imgui.OnFrame(function() return note.on end, function(self)
-    self.HideCursor = false
-    local W, H = math.min(sizeX * 0.86, 430 * S), 190 * S
-    imgui.SetNextWindowPos(V2(sizeX * 0.5, sizeY * 0.5), imgui.Cond.Always, V2(0.5, 0.5))
-    imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 14 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 8 * S)
-    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(16 * S, 14 * S))
-    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.015, 0.045, 0.085, 0.99))
-    imgui.PushStyleColor(imgui.Col.Text, V4(0.92, 0.97, 1.00, 1.00))
-    imgui.PushStyleColor(imgui.Col.Button, V4(0.035, 0.30, 0.52, 1.00))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.05, 0.42, 0.70, 1.00))
-    imgui.Begin(u8"Обновление Road Helper", nil, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoResize)
-    imgui.TextWrapped(u8(note.msg or "Доступно новое обновление."))
-    imgui.Spacing()
-    if imgui.Button(u8"ОБНОВИТЬ", V2((W - 48 * S) * 0.58, 42 * S)) then
-        note.on = false
-        applyUpdate()
-    end
-    imgui.SameLine()
-    if imgui.Button(u8"ПОЗЖЕ", V2((W - 48 * S) * 0.32, 42 * S)) then
-        note.on = false
-    end
-    imgui.End()
-    imgui.PopStyleColor(4)
-    imgui.PopStyleVar(3)
-end)
 
 imgui.OnFrame(function() return showCtrl[0] end, function(self)
     self.HideCursor = false
@@ -1274,22 +1355,35 @@ imgui.OnFrame(function() return showCtrl[0] end, function(self)
     imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
     imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(0, 0))
     imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(0, 0))
-    if working then
-        imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.12, 0.45, 0.22, 0.95))
-        imgui.PushStyleColor(imgui.Col.Button, V4(0.15, 0.55, 0.28, 0.0))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.18, 0.65, 0.32, 0.3))
-        imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.20, 0.70, 0.35, 0.5))
-    else
-        imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.45, 0.12, 0.15, 0.95))
-        imgui.PushStyleColor(imgui.Col.Button, V4(0.55, 0.15, 0.18, 0.0))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.65, 0.18, 0.22, 0.3))
-        imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.70, 0.20, 0.25, 0.5))
-    end
-    imgui.PushStyleColor(imgui.Col.Text, V4(1, 1, 1, 1))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.025, 0.075, 0.095, 0.98))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.075, 0.095, 0.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.05, 0.25, 0.29, 0.28))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.06, 0.35, 0.40, 0.42))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.82, 0.98, 1.00, 1.00))
     local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize
     imgui.Begin("##ctl", nil, flags)
-    local label = working and u8"СТОП" or u8"СТАРТ"
-    local hit = imgui.Button(label, V2(W, H))
+    local label = working and u8"ОСТАНОВИТЬ" or u8"СТАРТ"
+    local hit = imgui.Button("##rh_neon_control", V2(W, H))
+    local p1, p2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    local dl = imgui.GetWindowDrawList()
+    local borderColor = 0xFFDCBE37
+    local textColor = 0xFFB0DD42
+    local iconColor = 0xFFB0DD42
+    local textSize = imgui.CalcTextSize(label)
+    local iconSize = 11 * S
+    local groupW = iconSize + 9 * S + textSize.x
+    local groupX = p1.x + (W - groupW) * 0.5
+    local centerY = (p1.y + p2.y) * 0.5
+    pcall(function()
+        dl:AddRect(p1, p2, 0x66DCBE37, H * 0.5, 0, 4 * S)
+        dl:AddRect(p1, p2, borderColor, H * 0.5, 0, 1.8 * S)
+        if working then
+            dl:AddRectFilled(V2(groupX, centerY - iconSize * 0.5), V2(groupX + iconSize, centerY + iconSize * 0.5), iconColor, 2 * S)
+        else
+            dl:AddTriangleFilled(V2(groupX, centerY - iconSize * 0.55), V2(groupX, centerY + iconSize * 0.55), V2(groupX + iconSize, centerY), iconColor)
+        end
+        dl:AddText(V2(groupX + iconSize + 9 * S, centerY - imgui.GetFontSize() * 0.5), textColor, label)
+    end)
     if imgui.IsItemActive() and not drag then
         hold = hold + io.DeltaTime
         if hold >= HOLD then
@@ -1327,19 +1421,36 @@ imgui.OnFrame(function() return showRep[0] end, function(self)
     end
     imgui.SetNextWindowPos(V2(repX[0], repY[0]), imgui.Cond.Always)
     imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, H / 2)
-    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, H / 2 - 2)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 12 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 10 * S)
     imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
     imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(0, 0))
     imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(0, 0))
-    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.15, 0.35, 0.55, 0.95))
-    imgui.PushStyleColor(imgui.Col.Button, V4(0.18, 0.40, 0.60, 0.0))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.22, 0.48, 0.70, 0.3))
-    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.25, 0.55, 0.80, 0.5))
-    imgui.PushStyleColor(imgui.Col.Text, V4(1, 1, 1, 1))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.035, 0.095, 0.13, 0.98))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.035, 0.095, 0.13, 0.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.08, 0.25, 0.30, 0.30))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.10, 0.34, 0.40, 0.42))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.85, 0.97, 0.99, 1.00))
     local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize
     imgui.Begin("##rep", nil, flags)
-    local hit = imgui.Button(u8"МЕСТА", V2(W, H))
+    local hit = imgui.Button("##rh_location_button", V2(W, H))
+    local p1, p2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    local dl = imgui.GetWindowDrawList()
+    local label = u8"МЕСТО"
+    local textSize = imgui.CalcTextSize(label)
+    local pinSize = 18 * S
+    local groupW = pinSize + 9 * S + textSize.x
+    local groupX = p1.x + (W - groupW) * 0.5
+    local centerY = (p1.y + p2.y) * 0.5
+    local pinX = groupX + pinSize * 0.5
+    local pinY = centerY - 2 * S
+    pcall(function()
+        dl:AddRect(p1, p2, 0xFFC2AF38, 12 * S, 0, 1.6 * S)
+        dl:AddTriangleFilled(V2(pinX - pinSize * 0.43, pinY - pinSize * 0.10), V2(pinX + pinSize * 0.43, pinY - pinSize * 0.10), V2(pinX, pinY + pinSize * 0.62), 0xFFE5D655)
+        dl:AddCircleFilled(V2(pinX, pinY - pinSize * 0.12), pinSize * 0.43, 0xFFE5D655, 20)
+        dl:AddCircleFilled(V2(pinX, pinY - pinSize * 0.12), pinSize * 0.16, 0xFF3B2F20, 16)
+        dl:AddText(V2(groupX + pinSize + 9 * S, centerY - imgui.GetFontSize() * 0.5), 0xFFF8F6D9, label)
+    end)
     if imgui.IsItemActive() and not rdrag then
         rhold = rhold + io.DeltaTime
         if rhold >= HOLD then
@@ -1359,54 +1470,130 @@ imgui.OnFrame(function() return showRep[0] end, function(self)
     imgui.PopStyleVar(5)
 end)
 
+local function drawMiniStatRow(label, value, valueColor)
+    local valueText = u8(value)
+    local available = imgui.GetContentRegionAvail()
+    local valueSize = imgui.CalcTextSize(valueText)
+    imgui.TextDisabled(u8(label))
+    imgui.SameLine()
+    imgui.SetCursorPosX(math.max(92 * S, available.x - valueSize.x))
+    imgui.TextColored(valueColor or V4(0.82, 0.92, 0.97, 1.00), valueText)
+end
+
 imgui.OnFrame(function() return showStats[0] end, function(self)
     self.HideCursor = false
     local W, H = statW[0], statH[0]
     imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 10 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
-    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(12 * S, 10 * S))
-    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.012, 0.025, 0.055, 0.96))
-    imgui.PushStyleColor(imgui.Col.Text, V4(0.90, 0.95, 1.00, 1.00))
-    imgui.PushStyleColor(imgui.Col.TitleBg, V4(0.012, 0.045, 0.090, 1.00))
-    imgui.PushStyleColor(imgui.Col.TitleBgActive, V4(0.025, 0.095, 0.180, 1.00))
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 12 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1 * S)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(12 * S, 8 * S))
+    imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing, V2(6 * S, 3 * S))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.045, 0.075, 0.105, 0.98))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.88, 0.95, 0.98, 1.00))
+    imgui.PushStyleColor(imgui.Col.TextDisabled, V4(0.55, 0.69, 0.76, 1.00))
+    imgui.PushStyleColor(imgui.Col.TitleBg, V4(0.035, 0.075, 0.105, 1.00))
+    imgui.PushStyleColor(imgui.Col.TitleBgActive, V4(0.055, 0.16, 0.20, 1.00))
+    imgui.PushStyleColor(imgui.Col.Border, V4(0.14, 0.48, 0.57, 0.90))
     local flags = imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize
     imgui.Begin(u8"Статистика", nil, flags)
+
+    local headerAvailable = imgui.GetContentRegionAvail()
+    imgui.TextColored(V4(0.30, 0.78, 0.88, 1.00), u8"ROAD HELPER")
+    imgui.SameLine()
+    local status = working and u8"РАБОТАЕТ" or u8"ОСТАНОВЛЕН"
+    local statusSize = imgui.CalcTextSize(status)
+    imgui.SetCursorPosX(math.max(105 * S, headerAvailable.x - statusSize.x))
+    imgui.TextColored(working and V4(0.30, 0.88, 0.69, 1.00) or V4(0.55, 0.68, 0.75, 1.00), status)
+    imgui.Separator()
+
     if visTime[0] then
-        local c = working and V4(0.3, 0.95, 0.45, 1) or V4(0.95, 0.75, 0.30, 1)
-        imgui.TextColored(c, u8"Время: " .. fmtTime(workSec()))
+        drawMiniStatRow("Время", fmtTime(workSec()), working and V4(0.40, 0.88, 0.91, 1.00) or V4(0.78, 0.88, 0.93, 1.00))
     end
-    if visMoney[0] then imgui.Text(u8"Система: " .. fmtMoney(st.money)) end
+    if visMoney[0] then
+        drawMiniStatRow("Заработок", fmtMoney(st.money), V4(0.48, 0.84, 0.91, 1.00))
+    end
     if visFrame[0] then
-        imgui.Text(u8"Frame: " .. st.frame .. u8" (" .. fmtMoney(st.frame * casePrice[0]) .. ")")
+        drawMiniStatRow("Frame", tostring(st.frame) .. " шт. (" .. fmtMoney(st.frame * casePrice[0]) .. ")", V4(0.47, 0.78, 0.94, 1.00))
     end
-    if visChests[0] then imgui.Text(u8"Ларцы: " .. tostring(st.chests)) end
+    if visChests[0] then
+        drawMiniStatRow("Ларцы", tostring(st.chests) .. " шт.", V4(0.68, 0.84, 0.91, 1.00))
+    end
     if visTotal[0] then
-        imgui.Separator()
-        imgui.TextColored(V4(0.3, 0.95, 0.45, 1), u8"ИТОГО: " .. fmtMoney(totalMoney()))
+        imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.065, 0.19, 0.22, 1.00))
+        imgui.PushStyleColor(imgui.Col.Border, V4(0.16, 0.55, 0.63, 0.95))
+        imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 8 * S)
+        imgui.BeginChild("##rh_total_earnings", V2(-1, 58 * S), true)
+        imgui.TextDisabled(u8"ОБЩИЙ ЗАРАБОТОК")
+        imgui.TextColored(V4(0.38, 0.91, 0.83, 1.00), u8"$")
+        imgui.SameLine()
+        local totalDigits = string.sub(fmtMoney(totalMoney()), 2)
+        imgui.TextColored(V4(0.38, 0.91, 0.83, 1.00), u8(totalDigits))
+        imgui.EndChild()
+        imgui.PopStyleVar(1)
+        imgui.PopStyleColor(2)
     end
+
     imgui.End()
-    imgui.PopStyleColor(4)
-    imgui.PopStyleVar(3)
+    imgui.PopStyleColor(6)
+    imgui.PopStyleVar(4)
 end)
+
+-- Vehicle callbacks are guarded by both Auto Lock and the global START state.
+local sampevOk, sampev = pcall(require, 'lib.samp.events')
+if sampevOk and type(sampev) == "table" then
+    function sampev.onSendEnterVehicle(vehicleId, passenger)
+        if not featureOn(autoLock) then return end
+        lua_thread.create(function()
+            local waited = 0
+            while featureOn(autoLock) and not isCharInAnyCar(PLAYER_PED) and waited < 5000 do
+                wait(100)
+                waited = waited + 100
+            end
+            if not featureOn(autoLock) or not isCharInAnyCar(PLAYER_PED) then return end
+            wait(250)
+            if not featureOn(autoLock) then return end
+            sampSendChat('/lock')
+            wait(500)
+            if not featureOn(autoLock) then return end
+            sampSendChat('/key')
+            wait(500)
+            if not featureOn(autoLock) then return end
+            sampSendChat('/engine')
+        end)
+    end
+
+    function sampev.onSendExitVehicle(vehicleId)
+        if not featureOn(autoLock) then return end
+        lua_thread.create(function()
+            if not featureOn(autoLock) then return end
+            local ok, carHandle = sampGetCarHandleBySampVehicleId(vehicleId)
+            if ok and carHandle then
+                local statusOk, status = pcall(getCarDoorLockStatus, carHandle)
+                if statusOk and status == 0 and featureOn(autoLock) then
+                    sampSendChat('/lock')
+                end
+            end
+            wait(500)
+            if featureOn(autoLock) and isCharInAnyCar(PLAYER_PED) then
+                sampSendChat('/key')
+            end
+        end)
+    end
+end
 
 function main()
     while not isSampAvailable() do wait(100) end
     loadCfg()
     loadRoadIcons()
-    log("load 1.7 with external icons")
+    log("load 1.8")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.7", -1)
-    lua_thread.create(function()
-        wait(8000)
-        checkUpdate(true)
-    end)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.8", -1)
 
     local moneyAt = 0
     while true do
         wait(0)
 
-        if working and autoClick[0] and clicker then
+        if featureOn(autoClick) and clicker then
             tap()
             wait(TAP)
         end
@@ -1434,7 +1621,7 @@ function main()
             end
         end
 
-        if autoFlip[0] and working then
+        if featureOn(autoFlip) then
             if upside() then
                 if not flipT then flipT = os.clock() end
                 if not flipped and (os.clock() - flipT) >= flipDelay[0] then
