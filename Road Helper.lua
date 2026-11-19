@@ -2190,7 +2190,7 @@ function main()
     loadRoadIcons()
     log("load 2.6")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v2.6", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.1", -1)
 
     lua_thread.create(function()
         wait(9000)
