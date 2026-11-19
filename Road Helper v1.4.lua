@@ -931,7 +931,7 @@ end
 -- Проверяет версию прямо в удалённом Lua-файле GitHub.
 -- Конфигурация RoadHelper_config.ini не затрагивается.
 -- =========================================================
-local UPDATE_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/refs/heads/main/Road_Helper.lua"
+local UPDATE_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/refs/heads/main/Road%20Helper%20v1.4.lua"
 local updateState = {
     checking = false, downloading = false, prompt = false,
     available = false, latest = "", status = u8"Проверка ещё не выполнялась",
