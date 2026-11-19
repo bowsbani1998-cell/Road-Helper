@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.5")
+script_version("1.6")
 
-local VER = "1.5"
+local VER = "1.6"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -1250,45 +1250,12 @@ local function installRoadHelperUpdate()
             return
         end
 
-        -- Финальная проверка уже установленного файла. Только после неё
-        -- удаляем резервную копию старого скрипта.
-        local installedFile = io.open(destination, "rb")
-        local installedBody = installedFile and installedFile:read("*a") or nil
-        if installedFile then installedFile:close() end
-        if not installedBody or installedBody ~= body then
-            pcall(os.remove, destination)
-            if movedOld then
-                pcall(os.rename, backupPath, destination)
-            else
-                local backup = io.open(backupPath, "rb")
-                local backupBody = backup and backup:read("*a") or nil
-                if backup then backup:close() end
-                if backupBody then
-                    local restore = io.open(destination, "wb")
-                    if restore then
-                        restore:write(backupBody)
-                        restore:close()
-                    end
-                end
-            end
-            pcall(os.remove, tempPath)
-            updateState.downloading = false
-            updateState.error = "Контрольная проверка установленного файла не пройдена"
-            updateState.stage = u8"Восстановлена предыдущая версия"
-            updateState.status = u8"Ошибка проверки установки"
-            return
-        end
-
-        -- Новый файл установлен и проверен: удаляем старую копию и временный файл.
-        pcall(os.remove, backupPath)
-        pcall(os.remove, tempPath)
         updateState.progress = 1
         updateState.stage = u8"Обновление установлено"
         updateState.status = u8"Установлена версия " .. remoteVersion
         updateState.downloading = false
         updateState.available = false
         updateState.prompt = false
-        updateState.dismissed = true
         updateState.remoteBody = nil
         updateToast("Road Helper обновлён до v" .. remoteVersion)
 
@@ -1358,7 +1325,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.4"
+    local sideText = u8"Road Helper v1.6"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1369,9 +1336,9 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
     local tabs = {
         {u8"ГЛАВНАЯ", 1, "home"},
-        {u8"НАСТРОЙКИ", 2, "settings"},
-        {u8"КНОПКИ", 3, "buttons"},
-        {u8"СТАТИСТИКА", 4, "statistics"},
+        {u8"ФУНКЦИИ", 2, "settings"},
+        {u8"СТАТИСТИКА", 3, "statistics"},
+        {u8"НАСТРОЙКИ", 4, "buttons"},
         {u8"АВТОР", 5, "author"}
     }
     for _, tab in ipairs(tabs) do
@@ -1422,9 +1389,9 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
     local headers = {
         u8"ПАНЕЛЬ УПРАВЛЕНИЯ",
-        u8"НАСТРОЙКИ ФУНКЦИЙ",
-        u8"ПЛАВАЮЩИЕ КНОПКИ",
+        u8"ИГРОВЫЕ ФУНКЦИИ",
         u8"СТАТИСТИКА РАБОТЫ",
+        u8"НАСТРОЙКИ ПРИЛОЖЕНИЯ",
         u8"ИНФОРМАЦИЯ О ПРОЕКТЕ"
     }
     imgui.SetWindowFontScale(1.12)
@@ -1534,7 +1501,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
             imgui.Spacing()
         end
 
-        imgui.TextDisabled(u8"ROAD HELPER / CONFIGURATION")
+        imgui.TextDisabled(u8"ИГРОВЫЕ ФУНКЦИИ / AUTOMATION")
         imgui.Spacing()
         settingsCard("auto_click", "АВТОКЛИКЕР МИНИ-ИГРЫ", "Автоматически нажимает, пока заполняется круг мини-игры.", autoClick, true)
         settingsCard("auto_captcha", "АВТОКАПЧА", "Распознаёт и помогает проходить появляющуюся капчу.", autoCaptcha, true)
@@ -1554,8 +1521,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
             sampAddChatMessage("{00BFFF}[Road Helper] Сохранено", -1)
         end
 
-    elseif ui.tab == 3 then
-        imgui.TextDisabled(u8"НАСТРОЙКА РАСПОЛОЖЕНИЯ И РАЗМЕРА")
+    elseif ui.tab == 4 then
+        imgui.TextDisabled(u8"ВНЕШНИЙ ВИД И РАСПОЛОЖЕНИЕ ЭЛЕМЕНТОВ")
         imgui.Spacing()
 
         local function buttonSettingsCard(id, title, description, enabled, toggleId)
@@ -1615,7 +1582,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
             sampAddChatMessage("{00BFFF}[Road Helper] Кнопки сохранены", -1)
         end
 
-    elseif ui.tab == 4 then
+    elseif ui.tab == 3 then
         imgui.TextDisabled(u8"РЕЗУЛЬТАТЫ ТЕКУЩЕЙ РАБОТЫ")
         imgui.Spacing()
 
