@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.7")
+script_version("1.8")
 
-local VER = "1.7"
+local VER = "1.8"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -1325,7 +1325,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.7"
+    local sideText = u8"Road Helper v1.8"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1355,8 +1355,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
             local pMin = imgui.GetItemRectMin()
             local pMax = imgui.GetItemRectMax()
             local iconSize = 25 * S
-            local iconX = pMin.x + 12 * S
-            local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5 + 1 * S
+            local iconX = pMin.x + 10 * S
+            local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5 + 0.58 * S
             pcall(function()
                 imgui.GetWindowDrawList():AddImage(iconTexture, V2(iconX, iconY), V2(iconX + iconSize, iconY + iconSize))
             end)
@@ -2037,7 +2037,7 @@ function main()
     loadRoadIcons()
     log("load 1.8")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.4", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.8", -1)
 
     lua_thread.create(function()
         wait(9000)
