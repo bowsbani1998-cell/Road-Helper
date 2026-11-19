@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.6")
+script_version("1.7")
 
-local VER = "1.6"
+local VER = "1.7"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -1325,7 +1325,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.6"
+    local sideText = u8"Road Helper v1.7"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1347,8 +1347,21 @@ imgui.OnFrame(function() return ui.open end, function(self)
             imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.285, 0.525, 1.0))
             imgui.PushStyleColor(imgui.Col.Border, V4(0.12, 0.58, 0.95, 1.0))
         end
-        if drawTabIcon(tab[3], 25 * S) then imgui.SameLine() end
-        if imgui.Button(tab[1], V2(-1, 42 * S)) then ui.tab = tab[2] end
+        -- Кнопка и её текст остаются на прежнем месте; значок рисуется
+        -- поверх кнопки слева и центрируется по вертикали внутри неё.
+        local clicked = imgui.Button(tab[1], V2(-1, 42 * S))
+        local iconTexture = iconTextures[tab[3]]
+        if iconTexture then
+            local pMin = imgui.GetItemRectMin()
+            local pMax = imgui.GetItemRectMax()
+            local iconSize = 25 * S
+            local iconX = pMin.x + 12 * S
+            local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5 + 1 * S
+            pcall(function()
+                imgui.GetWindowDrawList():AddImage(iconTexture, V2(iconX, iconY), V2(iconX + iconSize, iconY + iconSize))
+            end)
+        end
+        if clicked then ui.tab = tab[2] end
         if selected then imgui.PopStyleColor(2) end
         imgui.Spacing()
     end
