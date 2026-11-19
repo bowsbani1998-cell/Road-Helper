@@ -2,7 +2,7 @@ script_name("Road Helper")
 script_author("Bows")
 script_version("1.5")
 
-local VER = "1.4"
+local VER = "1.5"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -931,7 +931,7 @@ end
 -- Проверяет версию прямо в удалённом Lua-файле GitHub.
 -- Конфигурация RoadHelper_config.ini не затрагивается.
 -- =========================================================
-local UPDATE_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/refs/heads/main/Road%20Helper%20v1.4.lua"
+local UPDATE_URL = "https://raw.githubusercontent.com/bowsbani1998-cell/Road-Helper/refs/heads/main/Road%20Helper.lua"
 local updateState = {
     checking = false, downloading = false, prompt = false,
     available = false, latest = "", status = u8"Проверка ещё не выполнялась",
@@ -1250,12 +1250,45 @@ local function installRoadHelperUpdate()
             return
         end
 
+        -- Финальная проверка уже установленного файла. Только после неё
+        -- удаляем резервную копию старого скрипта.
+        local installedFile = io.open(destination, "rb")
+        local installedBody = installedFile and installedFile:read("*a") or nil
+        if installedFile then installedFile:close() end
+        if not installedBody or installedBody ~= body then
+            pcall(os.remove, destination)
+            if movedOld then
+                pcall(os.rename, backupPath, destination)
+            else
+                local backup = io.open(backupPath, "rb")
+                local backupBody = backup and backup:read("*a") or nil
+                if backup then backup:close() end
+                if backupBody then
+                    local restore = io.open(destination, "wb")
+                    if restore then
+                        restore:write(backupBody)
+                        restore:close()
+                    end
+                end
+            end
+            pcall(os.remove, tempPath)
+            updateState.downloading = false
+            updateState.error = "Контрольная проверка установленного файла не пройдена"
+            updateState.stage = u8"Восстановлена предыдущая версия"
+            updateState.status = u8"Ошибка проверки установки"
+            return
+        end
+
+        -- Новый файл установлен и проверен: удаляем старую копию и временный файл.
+        pcall(os.remove, backupPath)
+        pcall(os.remove, tempPath)
         updateState.progress = 1
         updateState.stage = u8"Обновление установлено"
         updateState.status = u8"Установлена версия " .. remoteVersion
         updateState.downloading = false
         updateState.available = false
         updateState.prompt = false
+        updateState.dismissed = true
         updateState.remoteBody = nil
         updateToast("Road Helper обновлён до v" .. remoteVersion)
 
