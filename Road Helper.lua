@@ -2,7 +2,7 @@ script_name("Road Helper")
 script_author("Bows")
 script_version("1.2")
 
-local VER = "1.1"
+local VER = "1.2"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
