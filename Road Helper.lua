@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("2.6")
+script_version("1.1")
 
-local VER = "2.6"
+local VER = "1.1"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -21,12 +21,12 @@ local cfgPath = getWorkingDirectory() .. "/RoadHelper_config.ini"
 local function log(_) end
 
 local ui = { open = false, tab = 1 }
-local settingsPage = 1 -- 1: кнопки, 2: интерфейс
-local uiTheme = 1
-local touchScroll = { down = false, lastY = 0 }
+ui.settingsPage = 1 -- 1: кнопки, 2: интерфейс
+ui.theme = 1
+ui.touchScroll = { down = false, lastY = 0 }
 
 -- Три цветовые схемы главного меню: исходная синяя, графитовая и фиолетовая.
-local UI_THEMES = {
+RH_UI_THEMES = {
     {
         name = "NEON BLUE",
         window = {0.012, 0.022, 0.045, 0.99}, child = {0.020, 0.043, 0.080, 0.99},
@@ -58,7 +58,7 @@ local UI_THEMES = {
         card = {0.105, 0.065, 0.16, 1.0}, cardInner = {0.075, 0.045, 0.12, 1.0}
     }
 }
-local function themeColor(c) return imgui.ImVec4(c[1], c[2], c[3], c[4]) end
+function RH_themeColor(c) return imgui.ImVec4(c[1], c[2], c[3], c[4]) end
 
 local autoClick   = new.bool(true)
 local autoTool    = new.bool(false)
@@ -212,7 +212,7 @@ local function saveCfg()
         f:write("repH=" .. repH[0] .. "\n")
         f:write("statW=" .. statW[0] .. "\n")
         f:write("statH=" .. statH[0] .. "\n")
-        f:write("uiTheme=" .. uiTheme .. "\n")
+        f:write("uiTheme=" .. ui.theme .. "\n")
         f:write("showCtrl=" .. b(showCtrl[0]) .. "\n")
         f:write("showRep=" .. b(showRep[0]) .. "\n")
         f:write("showStats=" .. b(showStats[0]) .. "\n")
@@ -264,7 +264,7 @@ local function loadCfg()
                 elseif k == "repH" and n then repH[0] = n
                 elseif k == "statW" and n then statW[0] = n
                 elseif k == "statH" and n then statH[0] = n
-                elseif k == "uiTheme" and n then uiTheme = math.max(1, math.min(3, math.floor(n)))
+                elseif k == "uiTheme" and n then ui.theme = math.max(1, math.min(3, math.floor(n)))
                 elseif k == "showCtrl" then showCtrl[0] = on
                 elseif k == "showRep" then showRep[0] = on
                 elseif k == "showStats" then showStats[0] = on
@@ -1351,22 +1351,22 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(10 * S, 10 * S))
     imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing, V2(7 * S, 7 * S))
 
-    local palette = UI_THEMES[uiTheme] or UI_THEMES[1]
-    imgui.PushStyleColor(imgui.Col.WindowBg, themeColor(palette.window))
-    imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.child))
-    imgui.PushStyleColor(imgui.Col.Button, themeColor(palette.button))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, themeColor(palette.hover))
-    imgui.PushStyleColor(imgui.Col.ButtonActive, themeColor(palette.active))
-    imgui.PushStyleColor(imgui.Col.FrameBg, themeColor(palette.frame))
-    imgui.PushStyleColor(imgui.Col.CheckMark, themeColor(palette.accent))
-    imgui.PushStyleColor(imgui.Col.SliderGrab, themeColor(palette.grab))
-    imgui.PushStyleColor(imgui.Col.SliderGrabActive, themeColor(palette.grabActive))
-    imgui.PushStyleColor(imgui.Col.FrameBgHovered, themeColor(palette.frameHover))
-    imgui.PushStyleColor(imgui.Col.Text, themeColor(palette.text))
-    imgui.PushStyleColor(imgui.Col.TextDisabled, themeColor(palette.disabled))
-    imgui.PushStyleColor(imgui.Col.Border, themeColor(palette.border))
-    imgui.PushStyleColor(imgui.Col.TitleBg, themeColor(palette.title))
-    imgui.PushStyleColor(imgui.Col.TitleBgActive, themeColor(palette.titleActive))
+    local palette = RH_UI_THEMES[ui.theme] or RH_UI_THEMES[1]
+    imgui.PushStyleColor(imgui.Col.WindowBg, RH_themeColor(palette.window))
+    imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.child))
+    imgui.PushStyleColor(imgui.Col.Button, RH_themeColor(palette.button))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, RH_themeColor(palette.hover))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, RH_themeColor(palette.active))
+    imgui.PushStyleColor(imgui.Col.FrameBg, RH_themeColor(palette.frame))
+    imgui.PushStyleColor(imgui.Col.CheckMark, RH_themeColor(palette.accent))
+    imgui.PushStyleColor(imgui.Col.SliderGrab, RH_themeColor(palette.grab))
+    imgui.PushStyleColor(imgui.Col.SliderGrabActive, RH_themeColor(palette.grabActive))
+    imgui.PushStyleColor(imgui.Col.FrameBgHovered, RH_themeColor(palette.frameHover))
+    imgui.PushStyleColor(imgui.Col.Text, RH_themeColor(palette.text))
+    imgui.PushStyleColor(imgui.Col.TextDisabled, RH_themeColor(palette.disabled))
+    imgui.PushStyleColor(imgui.Col.Border, RH_themeColor(palette.border))
+    imgui.PushStyleColor(imgui.Col.TitleBg, RH_themeColor(palette.title))
+    imgui.PushStyleColor(imgui.Col.TitleBgActive, RH_themeColor(palette.titleActive))
 
     imgui.Begin(u8"##road_helper_main", nil, imgui.WindowFlags.NoCollapse)
 
@@ -1388,7 +1388,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v2.6"
+    local sideText = u8"Road Helper v1.1"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1461,18 +1461,18 @@ imgui.OnFrame(function() return ui.open end, function(self)
     local mouseY = io.MousePos.y
     local hovered = imgui.IsWindowHovered()
     if mouseDown and hovered and not imgui.IsAnyItemActive() then
-        if not touchScroll.down then
-            touchScroll.down = true
-            touchScroll.lastY = mouseY
+        if not ui.touchScroll.down then
+            ui.touchScroll.down = true
+            ui.touchScroll.lastY = mouseY
         else
-            local dy = mouseY - touchScroll.lastY
+            local dy = mouseY - ui.touchScroll.lastY
             if math.abs(dy) > 0 then
                 imgui.SetScrollY(math.max(0, imgui.GetScrollY() - dy * 1.10))
-                touchScroll.lastY = mouseY
+                ui.touchScroll.lastY = mouseY
             end
         end
     else
-        touchScroll.down = false
+        ui.touchScroll.down = false
     end
 
     local headers = {
@@ -1483,7 +1483,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         u8"ИНФОРМАЦИЯ О ПРОЕКТЕ"
     }
     imgui.SetWindowFontScale(1.12)
-    imgui.TextColored(themeColor(palette.accent), headers[ui.tab] or u8"ROAD HELPER")
+    imgui.TextColored(RH_themeColor(palette.accent), headers[ui.tab] or u8"ROAD HELPER")
     imgui.SetWindowFontScale(1.0)
     imgui.Separator()
     imgui.Spacing()
@@ -1570,7 +1570,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     elseif ui.tab == 2 then
         -- Премиум Dark Neon: отдельные карточки с описаниями и предупреждениями.
         local function settingsCard(id, title, description, value, banWarning, onChanged)
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.card))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
             imgui.BeginChild("##settings_card_" .. id, V2(-1, 92 * S), true)
             local cardW = imgui.GetContentRegionAvail().x
             imgui.BeginChild("##settings_info_" .. id, V2(cardW * 0.70, -1), false)
@@ -1613,21 +1613,21 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.TextDisabled(u8"НАСТРОЙКИ ПРИЛОЖЕНИЯ")
         imgui.Spacing()
         local subW = (imgui.GetContentRegionAvail().x - 8 * S) * 0.5
-        if settingsPage == 1 then
-            imgui.PushStyleColor(imgui.Col.Button, themeColor(palette.active))
+        if ui.settingsPage == 1 then
+            imgui.PushStyleColor(imgui.Col.Button, RH_themeColor(palette.active))
         end
-        if imgui.Button(u8"КНОПКИ", V2(subW, 40 * S)) then settingsPage = 1 end
-        if settingsPage == 1 then imgui.PopStyleColor() end
+        if imgui.Button(u8"КНОПКИ", V2(subW, 40 * S)) then ui.settingsPage = 1 end
+        if ui.settingsPage == 1 then imgui.PopStyleColor() end
         imgui.SameLine()
-        if settingsPage == 2 then imgui.PushStyleColor(imgui.Col.Button, themeColor(palette.active)) end
-        if imgui.Button(u8"ИНТЕРФЕЙС", V2(-1, 40 * S)) then settingsPage = 2 end
-        if settingsPage == 2 then imgui.PopStyleColor() end
+        if ui.settingsPage == 2 then imgui.PushStyleColor(imgui.Col.Button, RH_themeColor(palette.active)) end
+        if imgui.Button(u8"ИНТЕРФЕЙС", V2(-1, 40 * S)) then ui.settingsPage = 2 end
+        if ui.settingsPage == 2 then imgui.PopStyleColor() end
         imgui.Spacing()
         imgui.Separator()
         imgui.Spacing()
 
-        if settingsPage == 2 then
-            imgui.TextColored(themeColor(palette.accent), u8"ВЫБОР ОФОРМЛЕНИЯ")
+        if ui.settingsPage == 2 then
+            imgui.TextColored(RH_themeColor(palette.accent), u8"ВЫБОР ОФОРМЛЕНИЯ")
             imgui.TextDisabled(u8"Выбери цветовую тему главного окна Road Helper.")
             imgui.Spacing()
             local themeDescriptions = {
@@ -1635,27 +1635,27 @@ imgui.OnFrame(function() return ui.open end, function(self)
                 "Графитовый фон с тёплыми оранжевыми акцентами.",
                 "Тёмно-фиолетовый фон с яркими сиреневыми акцентами."
             }
-            for i, th in ipairs(UI_THEMES) do
-                local chosen = (uiTheme == i)
+            for i, th in ipairs(RH_UI_THEMES) do
+                local chosen = (ui.theme == i)
                 if chosen then
-                    imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.cardInner))
-                    imgui.PushStyleColor(imgui.Col.Border, themeColor(palette.accent))
+                    imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
+                    imgui.PushStyleColor(imgui.Col.Border, RH_themeColor(palette.accent))
                 else
-                    imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.card))
+                    imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
                 end
                 imgui.BeginChild("##rh_theme_" .. i, V2(-1, 92 * S), true)
                 local themeCardW = imgui.GetContentRegionAvail().x
                 imgui.BeginChild("##rh_theme_info_" .. i, V2(themeCardW * 0.68, -1), false)
-                imgui.TextColored(themeColor(UI_THEMES[i].accent), u8(th.name))
+                imgui.TextColored(RH_themeColor(RH_UI_THEMES[i].accent), u8(th.name))
                 imgui.TextDisabled(u8(themeDescriptions[i]))
                 imgui.EndChild()
                 imgui.SameLine()
                 imgui.BeginChild("##rh_theme_action_" .. i, V2(0, -1), false)
                 imgui.SetCursorPosY((imgui.GetWindowHeight() - 38 * S) * 0.5)
                 if chosen then
-                    imgui.TextColored(themeColor(palette.accent), u8"ВЫБРАНА")
+                    imgui.TextColored(RH_themeColor(palette.accent), u8"ВЫБРАНА")
                 elseif imgui.Button(u8"ПРИМЕНИТЬ##theme" .. i, V2(-1, 38 * S)) then
-                    uiTheme = i
+                    ui.theme = i
                     mark()
                     saveCfg()
                 end
@@ -1666,7 +1666,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
             end
             imgui.TextDisabled(u8"Выбранная тема сохраняется автоматически и останется после перезапуска.")
             if imgui.Button(u8"ВОЗВРАТ К СТАНДАРТНОЙ ТЕМЕ", V2(-1, 40 * S)) then
-                uiTheme = 1
+                ui.theme = 1
                 mark()
                 saveCfg()
             end
@@ -1675,7 +1675,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Spacing()
 
         local function buttonSettingsCard(id, title, description, enabled, toggleId)
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.card))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
             imgui.BeginChild("##button_card_" .. id, V2(-1, 92 * S), true)
             local cardW = imgui.GetContentRegionAvail().x
             imgui.BeginChild("##button_info_" .. id, V2(cardW * 0.70, -1), false)
@@ -1694,7 +1694,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         buttonSettingsCard("control", "КНОПКА СТАРТ / СТОП", "Показывать плавающую кнопку управления работой.", showCtrl, "show_ctrl")
         if showCtrl[0] then
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.cardInner))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
             imgui.BeginChild("##button_control_values", V2(-1, 150 * S), true)
             imgui.Text(u8"Положение X")
             if imgui.SliderInt("##cpx", ctrlX, 0, math.max(0, sizeX - 50)) then mark() end
@@ -1711,7 +1711,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Spacing()
         buttonSettingsCard("repairs", "КНОПКА МЕСТА РЕМОНТА", "Показывать плавающую кнопку быстрого доступа к местам ремонта.", showRep, "show_rep")
         if showRep[0] then
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.cardInner))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
             imgui.BeginChild("##button_repairs_values", V2(-1, 150 * S), true)
             imgui.Text(u8"Положение X")
             if imgui.SliderInt("##rpx", repX, 0, math.max(0, sizeX - 50)) then mark() end
@@ -1730,14 +1730,14 @@ imgui.OnFrame(function() return ui.open end, function(self)
             saveCfg()
             sampAddChatMessage("{00BFFF}[Road Helper] Кнопки сохранены", -1)
         end
-        end -- settingsPage
+        end -- ui.settingsPage
 
     elseif ui.tab == 3 then
         imgui.TextDisabled(u8"РЕЗУЛЬТАТЫ ТЕКУЩЕЙ РАБОТЫ")
         imgui.Spacing()
 
         local function statToggleCard(id, title, description, value)
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.card))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
             imgui.BeginChild("##stat_card_" .. id, V2(-1, 92 * S), true)
             local cardW = imgui.GetContentRegionAvail().x
             imgui.BeginChild("##stat_info_" .. id, V2(cardW * 0.70, -1), false)
@@ -1756,7 +1756,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         statToggleCard("show_stats", "ОКНО СТАТИСТИКИ", "Показывать отдельное плавающее окно статистики.", showStats)
         if showStats[0] then
-            imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.cardInner))
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
             imgui.BeginChild("##stat_dimensions", V2(-1, 86 * S), true)
             imgui.Text(u8"Ширина окна")
             if imgui.SliderInt("##sw", statW, 280, 480) then mark() end
@@ -1772,7 +1772,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         statToggleCard("vis_chests", "ДРУГИЕ ЛАРЦЫ И КЕЙСЫ", "Считать полученные ларцы и кейсы, кроме Frame.", visChests)
         statToggleCard("vis_total", "ОБЩИЙ ЗАРАБОТОК", "Отображать сумму системного заработка и стоимости Frame.", visTotal)
 
-        imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.cardInner))
+        imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
         imgui.BeginChild("##stat_price_card", V2(-1, 78 * S), true)
         imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ЦЕНА ОДНОГО FRAME ($)")
         imgui.PushItemWidth(-1)
@@ -1785,7 +1785,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.PopStyleColor()
 
         imgui.Spacing()
-        imgui.PushStyleColor(imgui.Col.ChildBg, themeColor(palette.card))
+        imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
         imgui.BeginChild("##stat_summary_card", V2(-1, 154 * S), true)
         imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"СВОДКА")
         imgui.Text(u8"Время работы:  " .. fmtTime(workSec()))
