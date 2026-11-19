@@ -1,6 +1,6 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.4")
+script_version("1.5")
 
 local VER = "1.4"
 local note = { on = false, t = 0, msg = "" }
