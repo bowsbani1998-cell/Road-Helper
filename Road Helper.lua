@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.2")
+script_version("1.3")
 
-local VER = "1.2"
+local VER = "1.3"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -1403,7 +1403,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.2"
+    local sideText = u8"Road Helper v1.3"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1830,6 +1830,15 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Text(u8"Автор: Bows")
         imgui.Text(u8"Платформа: Android / NeomLoader")
         imgui.Spacing()
+        imgui.Separator()
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ИСТОРИЯ ОБНОВЛЕНИЙ")
+        imgui.TextColored(V4(0.25, 0.88, 0.72, 1), u8"Версия 1.3  ·  20.11.2026")
+        imgui.BulletText(u8"Добавлено происшествие возле деревни Блуббери.")
+        imgui.BulletText(u8"Новые координаты добавлены в базу поиска ближайшего происшествия и авто-принятия заказа.")
+        imgui.Spacing()
+        imgui.Separator()
+        imgui.Spacing()
         imgui.PushStyleColor(imgui.Col.Button, V4(0.035, 0.30, 0.48, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.04, 0.42, 0.66, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.025, 0.24, 0.39, 1.0))
@@ -2172,21 +2181,22 @@ local function orderHexToString(hex)
 end
 
 local orderLocations = {
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F6 E5 ED F2 F0 E0 EB FC ED FB EC 20 E1 E0 ED EA EE EC 20 CB D1", x=1428.9106, y=-1698.7294, z=13.3528, label="Центральный банк ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=659.0522, y=-1190.9055, z=17.5485, label="Городская дорога ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 C0 F0 EC E8 E5 E9 20 D1 D4", x=-1560.7175, y=548.7899, z=7.0013, label="Армия СФ"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 D6 E5 ED F2 F0 EE EC 20 CB E8 F6 E5 ED E7 E8 F0 EE E2 E0 ED E8 FF", x=-2006.3367, y=-43.1771, z=34.8684, label="Центр лицензирования"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EA E0 E7 E8 ED EE 20 34 20 E4 F0 E0 EA EE ED E0", x=2046.2678, y=1064.1884, z=10.6419, label="Четыре дракона"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 CC EE ED F2 E3 EE EC E5 F0 E8", x=1514.3616, y=391.0710, z=19.8528, label="Монтгомери"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 4C 75 78 65 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=1012.2115, y=-1144.4158, z=23.6332, label="Отель Luxe ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 C0 ED E6 E5 EB 20 CF E0 E9 ED", x=-1983.4852, y=-2538.5493, z=36.6839, label="Энджел-Пайн"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 EC E5 E6 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5", x=-44.1579, y=-828.7866, z=12.0754, label="Междугородняя дорога"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 20 EF F0 EE EC FB F8 EB E5 ED ED EE EC 20 F0 E0 E9 EE ED E5 20 CB D1", x=2245.8167, y=-2042.4707, z=13.3841, label="Промышленный район ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 EE E7 EB E5 20 EE F2 E5 EB E5 E9 20 E3 E5 F2 F2 EE 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=2335.4211, y=-1750.4449, z=13.3528, label="Отели гетто ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 EE E7 EB E5 20 E0 E2 F2 EE E2 EE EA E7 E0 EB E0 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=1100.1532, y=-1712.9399, z=13.3528, label="Автовокзал ЛС"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E2 EE EA E7 E0 EB E5 20 CB E0 F1 20 C2 E5 ED F2 F3 F0 E0 F1", x=2828.6926, y=1414.1903, z=10.6826, label="Вокзал Лас-Вентурас"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F4 E5 F0 EC EE E9 20 CB FC ED E0 20 E8 20 D5 EB EE EF EA E0", x=-149.7158, y=-1345.8016, z=2.6313, label="Хлопковая ферма"},
-    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 C0 FD F0 EE EF EE F0 F2 EE EC 20 D1 D4", x=-1822.7681, y=-530.7723, z=14.9388, label="Отель аэропорта СФ"}
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F6 E5 ED F2 F0 E0 EB FC ED FB EC 20 E1 E0 ED EA EE EC 20 CB D1", x=1428.9106, y=-1698.7294, z=13.3528, label="Центральный банк ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=659.0522, y=-1190.9055, z=17.5485, label="Городская дорога ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 C0 F0 EC E8 E5 E9 20 D1 D4", x=-1560.7175, y=548.7899, z=7.0013, label="Армия СФ"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 D6 E5 ED F2 F0 EE EC 20 CB E8 F6 E5 ED E7 E8 F0 EE E2 E0 ED E8 FF", x=-2006.3367, y=-43.1771, z=34.8684, label="Центр лицензирования"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 EA E0 E7 E8 ED EE 20 34 20 E4 F0 E0 EA EE ED E0", x=2046.2678, y=1064.1884, z=10.6419, label="Четыре дракона"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 CC EE ED F2 E3 EE EC E5 F0 E8", x=1514.3616, y=391.0710, z=19.8528, label="Монтгомери"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 4C 75 78 65 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=1012.2115, y=-1144.4158, z=23.6332, label="Отель Luxe ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 C0 ED E6 E5 EB 20 CF E0 E9 ED", x=-1983.4852, y=-2538.5493, z=36.6839, label="Энджел-Пайн"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 EC E5 E6 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5", x=-44.1579, y=-828.7866, z=12.0754, label="Междугородняя дорога"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 E2 20 EF F0 EE EC FB F8 EB E5 ED ED EE EC 20 F0 E0 E9 EE ED E5 20 CB D1", x=2245.8167, y=-2042.4707, z=13.3841, label="Промышленный район ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 E2 EE E7 EB E5 20 EE F2 E5 EB E5 E9 20 E3 E5 F2 F2 EE 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=2335.4211, y=-1750.4449, z=13.3528, label="Отели гетто ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 E2 EE E7 EB E5 20 E0 E2 F2 EE E2 EE EA E7 E0 EB E0 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=1100.1532, y=-1712.9399, z=13.3528, label="Автовокзал ЛС"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E2 EE EA E7 E0 EB E5 20 CB E0 F1 20 C2 E5 ED F2 F3 F0 E0 F1", x=2828.6926, y=1414.1903, z=10.6826, label="Вокзал Лас-Вентурас"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F4 E5 F0 EC EE E9 20 CB FC ED E0 20 E8 20 D5 EB EE EF EA E0", x=-149.7158, y=-1345.8016, z=2.6313, label="Хлопковая ферма"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 C0 FD F0 EE EF EE F0 F2 EE EC 20 D1 D4", x=-1822.7681, y=-530.7723, z=14.9388, label="Отель аэропорта СФ"},
+    {hex="CF F0 EE E8 F1 F8 E5 F1 F2 E2 E8 E5 20 E2 EE E7 EB E5 20 E4 E5 F0 E5 E2 ED E8 20 C1 EB F3 E1 E1 E5 F0 E8", x=172.9209, y=62.8927, z=2.0559, label="Деревня Блуббери"}
 }
 local orderLocationByName = {}
 for i = 1, #orderLocations do
@@ -2212,45 +2222,9 @@ local function splitOrderTabs(value)
     return result
 end
 
--- Некоторые названия в самом диалоге отличаются от строк базы только
--- формой слова "Происшествие/Проишествия". Для таких строк сверяем
--- точный хвост названия в CP1251, не зависящий от этого префикса.
-local orderNameAliases = {
-    {hex="F0 FF E4 EE EC 20 F1 20 C0 F0 EC E8 E5 E9 20 D1 D4", label="Армия СФ"},
-    {hex="F0 FF E4 EE EC 20 F1 20 D6 E5 ED F2 F0 EE EC 20 CB E8 F6 E5 ED E7 E8 F0 EE E2 E0 ED E8 FF", label="Центр лицензирования"},
-    {hex="F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 C0 ED E6 E5 EB 20 CF E0 E9 ED", label="Энджел-Пайн"},
-    {hex="ED E0 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", label="Городская дорога ЛС"},
-    {hex="F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 4C 75 78 65 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", label="Отель Luxe ЛС"},
-    {hex="F0 FF E4 EE EC 20 F1 20 F4 E5 F0 EC EE E9 20 CB FC ED E0 20 E8 20 D5 EB EE EF EA E0", label="Хлопковая ферма"}
-}
-for i = 1, #orderNameAliases do
-    orderNameAliases[i].rawTail = orderHexToString(orderNameAliases[i].hex)
-end
-
+-- Точное сравнение исходных CP1251-байтов, как в отдельно проверенном Auto Order v0.8.
 local function findOrderLocation(name)
-    for i = 1, #orderLocations do
-        local location = orderLocations[i]
-        if name == location.rawName then
-            return location
-        end
-    end
-
-    -- Удаляем только первое слово-предисловие и сравниваем оставшуюся
-    -- часть названия с подтверждёнными строками из лога /repairs.
-    local _, tail = tostring(name or ""):match("^([^%s]+)%s+(.+)$")
-    if tail then
-        for i = 1, #orderNameAliases do
-            local alias = orderNameAliases[i]
-            if tail == alias.rawTail then
-                for j = 1, #orderLocations do
-                    if orderLocations[j].label == alias.label then
-                        return orderLocations[j]
-                    end
-                end
-            end
-        end
-    end
-    return nil
+    return orderLocationByName[tostring(name or "")]
 end
 
 local function analyzeOrderDialog(dialogText)
@@ -2430,7 +2404,7 @@ function main()
     loadRoadIcons()
     log("load 2.7.5")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.2", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.3", -1)
 
     lua_thread.create(function()
         wait(9000)
