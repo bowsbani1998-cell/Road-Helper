@@ -1,8 +1,8 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.1")
+script_version("1.2")
 
-local VER = "1.1"
+local VER = "1.2"
 local note = { on = false, t = 0, msg = "" }
 
 local imgui = require "mimgui"
@@ -67,6 +67,13 @@ local autoRepairs = new.bool(true)
 local autoFlip    = new.bool(true)
 local autoLock    = new.bool(false)
 local autoFill    = new.bool(false)
+
+RH_ORDER = RH_ORDER or {}
+RH_ORDER.enabled = new.bool(false)
+RH_ORDER.pending = nil
+RH_ORDER.pendingAt = 0
+RH_ORDER.dialogOpen = false
+RH_ORDER.processing = false
 local flipDelay   = new.float(0.75)
 
 local showCtrl  = new.bool(true)
@@ -228,6 +235,7 @@ local function saveCfg()
         f:write("autoFlip=" .. b(autoFlip[0]) .. "\n")
         f:write("autoLock=" .. b(autoLock[0]) .. "\n")
         f:write("autoFill=" .. b(autoFill[0]) .. "\n")
+        f:write("autoTakeOrder=" .. b(RH_ORDER.enabled[0]) .. "\n")
         f:write("flipDelay=" .. tostring(flipDelay[0]) .. "\n")
         f:write("casePrice=" .. casePrice[0] .. "\n")
         f:write("money=" .. st.money .. "\n")
@@ -280,6 +288,7 @@ local function loadCfg()
                 elseif k == "autoFlip" then autoFlip[0] = on
                 elseif k == "autoLock" then autoLock[0] = on
                 elseif k == "autoFill" then autoFill[0] = on
+                elseif k == "autoTakeOrder" then RH_ORDER.enabled[0] = on
                 elseif k == "flipDelay" and n then flipDelay[0] = math.max(0.1, math.min(3, n))
                 elseif k == "casePrice" and n then casePrice[0] = n
                 elseif k == "money" and n then st.money = n
@@ -335,6 +344,9 @@ local function setWork(on)
     if on then
         if working then return end
         working = true
+        RH_ORDER.pending = nil
+        RH_ORDER.dialogOpen = false
+        RH_ORDER.processing = false
         t0 = os.time()
         lastMoney = -1
         pendingLoot = nil
@@ -346,6 +358,9 @@ local function setWork(on)
         if t0 > 0 then elapsedWork = elapsedWork + math.max(0, os.time() - t0) end
         t0 = 0
         working = false
+        RH_ORDER.pending = nil
+        RH_ORDER.dialogOpen = false
+        RH_ORDER.processing = false
         log("stop")
         pendingLoot = nil
         clicker = false
@@ -1388,7 +1403,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.1"
+    local sideText = u8"Road Helper v1.2"
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1600,6 +1615,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         end)
         settingsCard("auto_lock", "АВТО ЛОК", "Закрывает автомобиль и выполняет команды при посадке/выходе.", autoLock, false)
         settingsCard("auto_fill", "АВТОФУЛЛ", "Автоматически заправляет автомобиль на АЗС.", autoFill, false)
+        settingsCard("auto_take_order", "АВТОВЗЯТИЕ ПРОИСШЕСТВИЯ", "Выбирает ближайшее происшествие из списка /repairs по координатам.", RH_ORDER.enabled, false)
 
         -- Задержка AutoFlip оставлена внутренней (0.75 сек.), отдельный ползунок убран,
         -- чтобы переключатель AutoFlip был доступен без прокрутки.
@@ -2142,8 +2158,232 @@ imgui.OnFrame(function() return showStats[0] end, function(self)
 end)
 
 -- Vehicle callbacks are guarded by both Auto Lock and the global START state.
+-- Автоматический выбор ближайшего происшествия в диалоге /repairs.
+-- Названия инцидентов сравниваются как исходные CP1251-байты, как в проверенном Auto Order v0.8.
+local ORDER_DIALOG_ID = 27650
+local ORDER_DELAY = 0.35
+
+local function orderHexToString(hex)
+    local out = {}
+    for byte in tostring(hex):gmatch("%x%x") do
+        out[#out + 1] = string.char(tonumber(byte, 16))
+    end
+    return table.concat(out)
+end
+
+local orderLocations = {
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F6 E5 ED F2 F0 E0 EB FC ED FB EC 20 E1 E0 ED EA EE EC 20 CB D1", x=1428.9106, y=-1698.7294, z=13.3528, label="Центральный банк ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=659.0522, y=-1190.9055, z=17.5485, label="Городская дорога ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 C0 F0 EC E8 E5 E9 20 D1 D4", x=-1560.7175, y=548.7899, z=7.0013, label="Армия СФ"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 D6 E5 ED F2 F0 EE EC 20 CB E8 F6 E5 ED E7 E8 F0 EE E2 E0 ED E8 FF", x=-2006.3367, y=-43.1771, z=34.8684, label="Центр лицензирования"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EA E0 E7 E8 ED EE 20 34 20 E4 F0 E0 EA EE ED E0", x=2046.2678, y=1064.1884, z=10.6419, label="Четыре дракона"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 CC EE ED F2 E3 EE EC E5 F0 E8", x=1514.3616, y=391.0710, z=19.8528, label="Монтгомери"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 4C 75 78 65 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=1012.2115, y=-1144.4158, z=23.6332, label="Отель Luxe ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 C0 ED E6 E5 EB 20 CF E0 E9 ED", x=-1983.4852, y=-2538.5493, z=36.6839, label="Энджел-Пайн"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 EC E5 E6 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5", x=-44.1579, y=-828.7866, z=12.0754, label="Междугородняя дорога"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 20 EF F0 EE EC FB F8 EB E5 ED ED EE EC 20 F0 E0 E9 EE ED E5 20 CB D1", x=2245.8167, y=-2042.4707, z=13.3841, label="Промышленный район ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 EE E7 EB E5 20 EE F2 E5 EB E5 E9 20 E3 E5 F2 F2 EE 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", x=2335.4211, y=-1750.4449, z=13.3528, label="Отели гетто ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 E2 EE E7 EB E5 20 E0 E2 F2 EE E2 EE EA E7 E0 EB E0 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", x=1100.1532, y=-1712.9399, z=13.3528, label="Автовокзал ЛС"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 E5 20 ED E0 20 E2 EE EA E7 E0 EB E5 20 CB E0 F1 20 C2 E5 ED F2 F3 F0 E0 F1", x=2828.6926, y=1414.1903, z=10.6826, label="Вокзал Лас-Вентурас"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 F4 E5 F0 EC EE E9 20 CB FC ED E0 20 E8 20 D5 EB EE EF EA E0", x=-149.7158, y=-1345.8016, z=2.6313, label="Хлопковая ферма"},
+    {hex="CF F0 EE E8 F8 E5 F1 F2 E2 E8 FF 20 F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 C0 FD F0 EE EF EE F0 F2 EE EC 20 D1 D4", x=-1822.7681, y=-530.7723, z=14.9388, label="Отель аэропорта СФ"}
+}
+local orderLocationByName = {}
+for i = 1, #orderLocations do
+    local location = orderLocations[i]
+    location.rawName = orderHexToString(location.hex)
+    orderLocationByName[location.rawName] = location
+end
+
+-- Разбор и сопоставление скопированы по принципу из проверенного
+-- отдельного Auto Order v0.8: точное сравнение исходных CP1251-байтов.
+local function splitOrderTabs(value)
+    local result = {}
+    local startPos = 1
+    while true do
+        local tabPos = value:find("\t", startPos, true)
+        if not tabPos then
+            result[#result + 1] = value:sub(startPos)
+            break
+        end
+        result[#result + 1] = value:sub(startPos, tabPos - 1)
+        startPos = tabPos + 1
+    end
+    return result
+end
+
+-- Некоторые названия в самом диалоге отличаются от строк базы только
+-- формой слова "Происшествие/Проишествия". Для таких строк сверяем
+-- точный хвост названия в CP1251, не зависящий от этого префикса.
+local orderNameAliases = {
+    {hex="F0 FF E4 EE EC 20 F1 20 C0 F0 EC E8 E5 E9 20 D1 D4", label="Армия СФ"},
+    {hex="F0 FF E4 EE EC 20 F1 20 D6 E5 ED F2 F0 EE EC 20 CB E8 F6 E5 ED E7 E8 F0 EE E2 E0 ED E8 FF", label="Центр лицензирования"},
+    {hex="F0 FF E4 EE EC 20 F1 20 E4 E5 F0 E5 E2 ED E5 E9 20 C0 ED E6 E5 EB 20 CF E0 E9 ED", label="Энджел-Пайн"},
+    {hex="ED E0 20 E3 EE F0 EE E4 F1 EA EE E9 20 E4 EE F0 EE E3 E5 20 CB EE F1 20 D1 E0 ED F2 EE F1 E0", label="Городская дорога ЛС"},
+    {hex="F0 FF E4 EE EC 20 F1 20 EE F2 E5 EB E5 EC 20 4C 75 78 65 20 E2 20 CB EE F1 20 D1 E0 ED F2 EE F1 E5", label="Отель Luxe ЛС"},
+    {hex="F0 FF E4 EE EC 20 F1 20 F4 E5 F0 EC EE E9 20 CB FC ED E0 20 E8 20 D5 EB EE EF EA E0", label="Хлопковая ферма"}
+}
+for i = 1, #orderNameAliases do
+    orderNameAliases[i].rawTail = orderHexToString(orderNameAliases[i].hex)
+end
+
+local function findOrderLocation(name)
+    for i = 1, #orderLocations do
+        local location = orderLocations[i]
+        if name == location.rawName then
+            return location
+        end
+    end
+
+    -- Удаляем только первое слово-предисловие и сравниваем оставшуюся
+    -- часть названия с подтверждёнными строками из лога /repairs.
+    local _, tail = tostring(name or ""):match("^([^%s]+)%s+(.+)$")
+    if tail then
+        for i = 1, #orderNameAliases do
+            local alias = orderNameAliases[i]
+            if tail == alias.rawTail then
+                for j = 1, #orderLocations do
+                    if orderLocations[j].label == alias.label then
+                        return orderLocations[j]
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function analyzeOrderDialog(dialogText)
+    if type(getCharCoordinates) ~= "function" or not PLAYER_PED then
+        return nil, "нет координат игрока"
+    end
+
+    local okPos, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+    if not okPos or type(px) ~= "number" or type(py) ~= "number"
+        or type(pz) ~= "number" or (px == 0 and py == 0) then
+        return nil, "не удалось получить координаты игрока"
+    end
+
+    local nearest = nil
+    local listIndex = 0
+    local parsedRows = 0
+    local matchedRows = 0
+
+    for line in tostring(dialogText or ""):gmatch("[^\r\n]+") do
+        -- Тот же шаблон, что в проверенном отдельном Auto Order v0.8.
+        local stars, incidentId, remainder =
+            line:match("^%s*%[(%*+)%]%s*%[(%d+)%](.*)$")
+
+        if incidentId then
+            local columns = splitOrderTabs(remainder)
+            local name = columns[1] or ""
+            local location = findOrderLocation(name)
+            parsedRows = parsedRows + 1
+
+            if location then
+                matchedRows = matchedRows + 1
+                local dx, dy = px - location.x, py - location.y
+                local distanceSq = dx * dx + dy * dy
+
+                if not nearest or distanceSq < nearest.distanceSq then
+                    nearest = {
+                        id = tonumber(incidentId),
+                        index = listIndex,
+                        location = location,
+                        distanceSq = distanceSq
+                    }
+                end
+            end
+
+            listIndex = listIndex + 1
+        end
+    end
+
+    if nearest then
+        nearest.distance = math.sqrt(nearest.distanceSq)
+        nearest.distanceSq = nil
+        return nearest
+    end
+    if parsedRows == 0 then
+        return nil, "не распознаны строки списка происшествий"
+    end
+    if matchedRows == 0 then
+        return nil, "названия строк не совпали с базой локаций (точное сравнение CP1251)"
+    end
+    return nil, "не найден подходящий заказ"
+end
+
+local function onOrderDialog(dialogId, style, title, button1, button2, dialogText)
+    if not working or not RH_ORDER.enabled[0] or tonumber(dialogId) ~= ORDER_DIALOG_ID then return end
+    RH_ORDER.dialogOpen = true
+    RH_ORDER.processing = false
+    local analyzeReason
+    RH_ORDER.pending, analyzeReason = analyzeOrderDialog(dialogText)
+    if RH_ORDER.pending then
+        RH_ORDER.pendingAt = os.clock() + ORDER_DELAY
+        local msg = "Ближайшее происшествие: " .. RH_ORDER.pending.location.label .. " (" .. string.format("%.0f", RH_ORDER.pending.distance) .. " м)"
+        sampAddChatMessage("{80D8FF}[RH-AUTO] {FFFFFF}" .. msg, -1)
+    else
+        sampAddChatMessage("{80D8FF}[RH-AUTO] {FFFFFF}Не удалось найти ближайшее происшествие: " .. tostring(analyzeReason or "неизвестная причина"), -1)
+    end
+end
+
+local function onOrderDialogResponse(dialogId, button, listItem, input)
+    if tonumber(dialogId) == ORDER_DIALOG_ID then
+        RH_ORDER.dialogOpen = false
+        RH_ORDER.pending = nil
+        RH_ORDER.processing = false
+    end
+end
+
+local function processPendingOrder()
+    if not working or not RH_ORDER.enabled[0] then RH_ORDER.pending = nil; return end
+    if not RH_ORDER.pending or RH_ORDER.processing then return end
+    if os.clock() < RH_ORDER.pendingAt then return end
+    if not RH_ORDER.dialogOpen then
+        RH_ORDER.pending = nil
+        return
+    end
+    if type(sampSendDialogResponse) ~= "function" then
+        RH_ORDER.pending = nil
+        sampAddChatMessage("{80D8FF}[RH-AUTO] {FFFFFF}Нет API отправки ответа на диалог.", -1)
+        return
+    end
+    if type(sampIsDialogActive) == "function" then
+        local okActive, active = pcall(sampIsDialogActive)
+        if okActive and not active then
+            RH_ORDER.pending = nil
+            RH_ORDER.dialogOpen = false
+            return
+        end
+    end
+    if type(sampGetCurrentDialogId) == "function" then
+        local okId, currentId = pcall(sampGetCurrentDialogId)
+        if okId and tonumber(currentId) ~= ORDER_DIALOG_ID then
+            RH_ORDER.pending = nil
+            RH_ORDER.dialogOpen = false
+            return
+        end
+    end
+    if not working or not RH_ORDER.enabled[0] then RH_ORDER.pending = nil; return end
+    local incident = RH_ORDER.pending
+    RH_ORDER.processing = true
+    local okSend = pcall(sampSendDialogResponse, ORDER_DIALOG_ID, 1, incident.index, "")
+    if okSend then
+        sampAddChatMessage("{80D8FF}[RH-AUTO] {FFFFFF}Выбираю: " .. incident.location.label .. " (#" .. tostring(incident.id) .. ")", -1)
+    else
+        sampAddChatMessage("{FF7777}[RH-AUTO] {FFFFFF}Не удалось выбрать заказ.", -1)
+    end
+    RH_ORDER.pending = nil
+    RH_ORDER.processing = false
+end
+
+
 local sampevOk, sampev = pcall(require, 'lib.samp.events')
+if not sampevOk then sampevOk, sampev = pcall(require, 'samp.events') end
 if sampevOk and type(sampev) == "table" then
+    sampev.onShowDialog = onOrderDialog
+    sampev.onSendDialogResponse = onOrderDialogResponse
     function sampev.onSendEnterVehicle(vehicleId, passenger)
         if not featureOn(autoLock) then return end
         lua_thread.create(function()
@@ -2188,9 +2428,9 @@ function main()
     while not isSampAvailable() do wait(100) end
     loadCfg()
     loadRoadIcons()
-    log("load 2.6")
+    log("load 2.7.5")
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.1", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.2", -1)
 
     lua_thread.create(function()
         wait(9000)
@@ -2202,6 +2442,7 @@ function main()
     local wasSampAvailable = true
     while true do
         wait(0)
+        processPendingOrder()
 
         local sampAvailable = isSampAvailable()
         if wasSampAvailable and not sampAvailable then
@@ -2209,6 +2450,9 @@ function main()
             elapsedWork = 0
             t0 = 0
             working = false
+            RH_ORDER.pending = nil
+            RH_ORDER.dialogOpen = false
+            RH_ORDER.processing = false
             clicker = false
             pendingLoot = nil
             autoFillGeneration = autoFillGeneration + 1
