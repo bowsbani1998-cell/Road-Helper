@@ -1,10 +1,11 @@
 script_name("Road Helper")
 script_author("Bows")
-script_version("1.3")
+script_version("1.4")
 
-local VER = "1.3"
+local VER = "1.4"
 local note = { on = false, t = 0, msg = "" }
 
+local bit = require "bit"
 local imgui = require "mimgui"
 local encoding = require "encoding"
 encoding.default = "CP1251"
@@ -17,11 +18,12 @@ local S = math.max(1.0, math.min(sizeY / 540, 2.0))
 
 local cfgPath = getWorkingDirectory() .. "/RoadHelper_config.ini"
 
--- Внутренние диагностические вызовы оставлены совместимыми, но файл лога не создаётся.
-local function log(_) end
-
 local ui = { open = false, tab = 1 }
 ui.settingsPage = 1 -- 1: кнопки, 2: интерфейс
+ui.functionIndex = 1
+ui.functionPopupData = nil
+local functionPopupOpen = new.bool(false)
+ui.statIndex = 1
 ui.theme = 1
 ui.touchScroll = { down = false, lastY = 0 }
 
@@ -89,6 +91,27 @@ local repX = new.int(20)
 local repY = new.int(math.floor(sizeY / 2 + 40))
 local repW = new.int(180)
 local repH = new.int(48)
+
+-- Отдельная плавающая кнопка управления автоматическим подбором инструментов.
+local showToolButton = new.bool(true)
+local toolX = new.int(20)
+local toolY = new.int(math.floor(sizeY / 2 + 100))
+local toolW = new.int(180)
+local toolH = new.int(48)
+local toolHold, toolDrag = 0, false
+local toolOx, toolOy = 0, 0
+local toolButtonGeneration = 0
+local toolStage = nil
+local toolNeedsManualTake = true
+local toolTrunkFlag = false
+local toolLastOpen = 0
+local toolQueueBusy = false
+local toolRepeatDelayMs = 50
+local toolIgnoreOutUntil = 0
+local toolLastHitAt = 0
+local toolRollerWaitAt = 0
+local TOOL_ROLLER_MENU_TIMEOUT = 5 * 60
+local toolStartQueue -- forward declaration: chat/hit stage changes can start the queue immediately
 
 local statW = new.int(350)
 local statH = new.int(280)
@@ -171,7 +194,6 @@ local function openRepairs()
     if now < repairsAt then return end
     repairsAt = now + 5.0
     sampSendChat("/repairs")
-    log("repairs")
 end
 
 local function qmul(a, b, c, d, w, x, y, z)
@@ -217,6 +239,11 @@ local function saveCfg()
         f:write("repY=" .. repY[0] .. "\n")
         f:write("repW=" .. repW[0] .. "\n")
         f:write("repH=" .. repH[0] .. "\n")
+        f:write("toolX=" .. toolX[0] .. "\n")
+        f:write("toolY=" .. toolY[0] .. "\n")
+        f:write("toolW=" .. toolW[0] .. "\n")
+        f:write("toolH=" .. toolH[0] .. "\n")
+        f:write("showToolButton=" .. b(showToolButton[0]) .. "\n")
         f:write("statW=" .. statW[0] .. "\n")
         f:write("statH=" .. statH[0] .. "\n")
         f:write("uiTheme=" .. ui.theme .. "\n")
@@ -245,7 +272,6 @@ local function saveCfg()
         f:close()
         dirty = false
         savedAt = os.clock()
-        log("cfg")
     end)
 end
 
@@ -253,7 +279,6 @@ local function loadCfg()
     pcall(function()
         local f = io.open(cfgPath, "r")
         if not f then
-            log("cfg miss")
             return
         end
         for line in f:lines() do
@@ -270,6 +295,11 @@ local function loadCfg()
                 elseif k == "repY" and n then repY[0] = n
                 elseif k == "repW" and n then repW[0] = n
                 elseif k == "repH" and n then repH[0] = n
+                elseif k == "toolX" and n then toolX[0] = n
+                elseif k == "toolY" and n then toolY[0] = n
+                elseif k == "toolW" and n then toolW[0] = n
+                elseif k == "toolH" and n then toolH[0] = n
+                elseif k == "showToolButton" then showToolButton[0] = on
                 elseif k == "statW" and n then statW[0] = n
                 elseif k == "statH" and n then statH[0] = n
                 elseif k == "uiTheme" and n then ui.theme = math.max(1, math.min(3, math.floor(n)))
@@ -312,6 +342,7 @@ local function loadCfg()
                 elseif k == "stats_height" and n then statH[0] = n
                 elseif k == "show_control" then showCtrl[0] = on
                 elseif k == "show_repairs" then showRep[0] = on
+                elseif k == "show_tool_button" then showToolButton[0] = on
                 elseif k == "show_stats" then showStats[0] = on
                 elseif k == "show_stat_time" then visTime[0] = on
                 elseif k == "show_stat_money" then visMoney[0] = on
@@ -332,7 +363,6 @@ local function loadCfg()
         f:close()
         statW[0] = math.max(280, math.min(480, statW[0]))
         statH[0] = math.max(260, math.min(380, statH[0]))
-        log("cfg ok")
     end)
 end
 
@@ -344,13 +374,19 @@ local function setWork(on)
     if on then
         if working then return end
         working = true
+        -- Автоинструмент подчиняется общему СТАРТ/СТОП: при старте ждём
+        -- первое ручное взятие инструмента, чтобы синхронизировать этап.
+        toolButtonGeneration = toolButtonGeneration + 1
+        toolQueueBusy = false
+        toolTrunkFlag = false
+        toolStage = nil
+        toolNeedsManualTake = true
         RH_ORDER.pending = nil
         RH_ORDER.dialogOpen = false
         RH_ORDER.processing = false
         t0 = os.time()
         lastMoney = -1
         pendingLoot = nil
-        log("start")
         trunk = false
         sampAddChatMessage("{00FF00}[Road Helper] Запущен", -1)
     else
@@ -358,10 +394,16 @@ local function setWork(on)
         if t0 > 0 then elapsedWork = elapsedWork + math.max(0, os.time() - t0) end
         t0 = 0
         working = false
+        -- СТОП полностью отключает текущую сессию автоинструмента и сбрасывает этап.
+        toolButtonGeneration = toolButtonGeneration + 1
+        toolStage = nil
+        toolNeedsManualTake = true
+        toolQueueBusy = false
+        toolTrunkFlag = false
+        toolRollerWaitAt = 0
         RH_ORDER.pending = nil
         RH_ORDER.dialogOpen = false
         RH_ORDER.processing = false
-        log("stop")
         pendingLoot = nil
         clicker = false
         autoFillGeneration = autoFillGeneration + 1
@@ -519,7 +561,6 @@ function tap()
     sendClickIface(25, 0, 0, "")
     sendCef("clickMinigame")
     st.clicks = st.clicks + 1
-    if st.clicks % 10 == 1 then log("tap " .. st.clicks) end
 end
 
 function onReceivePacket(id, bs)
@@ -539,26 +580,18 @@ function onReceivePacket(id, bs)
         end
         cmd = tostring(cmd or "")
         if #cmd > 220 then cmd = cmd:sub(1, 220) end
-        if working or trunk then
-            log("cef " .. cmd)
-        end
-        local low = string.lower(cmd)
-
         if string.find(cmd, "Clicker", 1, true)
             or string.find(cmd, "clicker.setProgress", 1, true)
             or string.find(cmd, "clickMinigame", 1, true) then
-            if not clicker then log("clicker on") end
             clicker = true
         end
 
         if string.find(cmd, "event.setActiveView", 1, true) and string.find(cmd, "null", 1, true) then
-            if clicker then log("clicker off") end
             clicker = false
         end
 
         if featureOn(autoCaptcha) then
             if string.find(cmd, "FindGame", 1, true) or string.find(cmd, "findGame", 1, true) then
-                log("findgame")
                 lua_thread.create(function()
                     wait(150)
                     if not featureOn(autoCaptcha) then return end
@@ -575,18 +608,8 @@ function onReceivePacket(id, bs)
     elseif p == 84 then
         local iid = raknetBitStreamReadInt8(bs)
         local sub = raknetBitStreamReadInt8(bs)
-        local extra = ""
-        if iid == 101 or trunk then
-            pcall(function()
-                extra = " x=" .. tostring(raknetBitStreamReadInt32(bs)) .. " y=" .. tostring(raknetBitStreamReadInt32(bs))
-            end)
-        end
-        if iid ~= 8 and iid ~= 52 then
-            log("i84 " .. tostring(iid) .. " " .. tostring(sub) .. extra)
-        end
         if iid == 25 and not clicker then
             clicker = true
-            log("clicker on")
         end
 
         -- Frontend payload for AutoFill: length, encoding flag, JSON/text body.
@@ -606,12 +629,8 @@ function onReceivePacket(id, bs)
     elseif p == 62 then
         local iid = raknetBitStreamReadInt8(bs)
         local on = raknetBitStreamReadBool(bs)
-        if iid ~= 8 and iid ~= 52 and iid ~= 87 and iid ~= 17 then
-            log("i62 " .. tostring(iid) .. " " .. tostring(on))
-        end
         if iid == 101 then
             trunk = on and true or false
-            log(on and "TRUNK OPEN" or "TRUNK CLOSE")
         end
         if iid == GAS_INTERFACE_ID and featureOn(autoFill) then
             sendGasInterfaceState(iid, on)
@@ -621,16 +640,13 @@ function onReceivePacket(id, bs)
         if iid == 25 then
             if on then
                 clicker = true
-                log("clicker on")
             else
                 clicker = false
-                log("clicker off")
                 mark()
             end
         end
 
         if iid == 81 and on and featureOn(autoCaptcha) then
-            log("cap on")
             lua_thread.create(function()
                 wait(120)
                 if not featureOn(autoCaptcha) then return end
@@ -645,55 +661,208 @@ function onReceivePacket(id, bs)
                     sendClickIface(81, 0, 0, "")
                     wait(60)
                 end
-                log("cap done")
             end)
-        end
-        if iid == 81 and not on then log("cap off") end
-    elseif working or trunk then
-        if p ~= 155 and p ~= 216 and p ~= 221 and p ~= 159 and p ~= 108 then
-            log("p" .. tostring(p))
         end
     end
 end
 
-local function logBit(prefix, bs)
-    local ok, err = pcall(function()
-        raknetBitStreamIgnoreBits(bs, 8)
-        local p = raknetBitStreamReadInt8(bs)
-        if p == 17 then
-            raknetBitStreamIgnoreBits(bs, 32)
-            local len = raknetBitStreamReadInt16(bs)
-            local enc = raknetBitStreamReadInt8(bs)
-            local cmd
-            if enc == 0 then cmd = raknetBitStreamReadString(bs, len)
-            else cmd = raknetBitStreamDecodeString(bs, len + enc) end
-            cmd = tostring(cmd or "")
-            if #cmd > 220 then cmd = cmd:sub(1, 220) end
-            log(prefix .. " cef " .. cmd)
-        elseif p == 63 or p == 18 or p == 66 or p == 62 or p == 84 then
-            local iid = raknetBitStreamReadInt8(bs)
-            log(prefix .. " t" .. tostring(p) .. " id=" .. tostring(iid))
-        else
-            log(prefix .. " t" .. tostring(p))
+local TOOL_ITEMS = {
+    { key = "barrier", name = "Заграждение", code = 0x30, repeatTake = true, count = 4 },
+    { key = "hammer", name = "Молоток", code = 0x31 },
+    { key = "trash", name = "Мусор" },
+    { key = "wrench", name = "Гаечный ключ", code = 0x32 },
+    { key = "asphalt", name = "Асфальт", code = 0x33, repeatTake = true, count = 4 },
+    { key = "roller", name = "Каток", code = 0x34 }
+}
+-- Этапы определяются только по ключевым словам в сообщениях сервера.
+-- Заграждение намеренно отсутствует: сервер не присылает для него сообщение,
+-- поэтому первый этап с заграждением определяется только ручным взятием.
+local TOOL_CHAT_STAGES = {
+    { phrase = "Приступайте к устранению старого асфальта с помощью отбойного молотка.", key = "hammer" },
+    { phrase = "Возьмите дорожный каток из служебного автомобиля и выровняйте все засыпанные дорожные ямы.", key = "roller" },
+    { phrase = "Приступайте к починке труб в образовавшихся ямах.", key = "wrench" },
+    { phrase = "Уберите мусор из дорожных ям и погрузите его в служебный автомобиль.", key = "trash" },
+    { phrase = "Приступайте к засыпанию дорожных ям новым асфальтом.", key = "asphalt" }
+}
+
+local function toolNormalize(s)
+    s = tostring(s or ""):gsub("{%x+}", "")
+    -- Lua 5.1 string.lower не обрабатывает кириллицу.
+    local upperToLower = {
+        ["А"]="а", ["Б"]="б", ["В"]="в", ["Г"]="г", ["Д"]="д",
+        ["Е"]="е", ["Ё"]="ё", ["Ж"]="ж", ["З"]="з", ["И"]="и",
+        ["Й"]="й", ["К"]="к", ["Л"]="л", ["М"]="м", ["Н"]="н",
+        ["О"]="о", ["П"]="п", ["Р"]="р", ["С"]="с", ["Т"]="т",
+        ["У"]="у", ["Ф"]="ф", ["Х"]="х", ["Ц"]="ц", ["Ч"]="ч",
+        ["Ш"]="ш", ["Щ"]="щ", ["Ъ"]="ъ", ["Ы"]="ы", ["Ь"]="ь",
+        ["Э"]="э", ["Ю"]="ю", ["Я"]="я"
+    }
+    for upper, lower in pairs(upperToLower) do s = s:gsub(upper, lower) end
+    s = s:gsub("[\r\n]+", " "):gsub("[%s]+", " ")
+    return s:lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function toolFindByKey(key)
+    for i, item in ipairs(TOOL_ITEMS) do if item.key == key then return i end end
+    return nil
+end
+
+local function toolSetStage(index, source)
+    if not index or not TOOL_ITEMS[index] then
+        return
+    end
+    local changed = toolStage ~= index
+    if changed then
+        toolStage = index
+        toolButtonGeneration = toolButtonGeneration + 1
+        toolQueueBusy = false
+        if TOOL_ITEMS[index].key ~= "roller" then
+            toolRollerWaitAt = 0
+        end
+    end
+
+    if not featureOn(autoTool) then return end
+    if changed then
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап определён: {00FF88}" .. TOOL_ITEMS[index].name, -1)
+    end
+
+    -- После повторного включения ждём первое ручное взятие инструмента.
+    -- Дальше этапы берутся из сообщений сервера и очередь запускается автоматически.
+    if source == "chat" and TOOL_ITEMS[index].code and toolStartQueue and not toolNeedsManualTake then
+        toolStartQueue()
+    elseif not TOOL_ITEMS[index].code and (source == "chat" or source == "fist-hit") then
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап «{FFCC55}" .. TOOL_ITEMS[index].name .. "{FFFFFF}» — действие выполняется вручную.", -1)
+    end
+end
+
+local function toolSetEnabled(on)
+    autoTool[0] = on and true or false
+    toolButtonGeneration = toolButtonGeneration + 1
+    toolQueueBusy = false
+    toolTrunkFlag = false
+    toolLastHitAt = 0
+    toolRollerWaitAt = 0
+    if autoTool[0] then
+        toolStage = nil
+        toolNeedsManualTake = true
+        toolRollerWaitAt = 0
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Включено. Жду сообщение сервера или ваше первое ручное взятие инструмента.", -1)
+    else
+        toolStage = nil
+        toolNeedsManualTake = true
+        sampAddChatMessage("{FF7777}[ИНСТРУМЕНТ] {FFFFFF}Выключено. Этап сброшен.", -1)
+    end
+    mark()
+    saveCfg()
+end
+
+local function toolPacketFor(item)
+    if not item or not item.code then return nil end
+    return {0x3F, 0x65, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, item.code}
+end
+
+local function toolSendRaw(bytes)
+    if not featureOn(autoTool) or not bytes or not isSampAvailable() then return false end
+    toolIgnoreOutUntil = os.clock() + 0.25
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    for _, b in ipairs(bytes) do raknetBitStreamWriteInt8(bs, b) end
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+    return true
+end
+
+toolStartQueue = function()
+    if not featureOn(autoTool) then return end
+    if toolNeedsManualTake then return end
+    if not toolStage then return end
+    if toolQueueBusy then return end
+    local generation = toolButtonGeneration
+    local item = TOOL_ITEMS[toolStage]
+    if item.key == "roller" then toolRollerWaitAt = os.clock() end
+    local bytes = toolPacketFor(item)
+    if not bytes then
+        sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Этап «" .. item.name .. "» — действие выполняется вручную.", -1)
+        return
+    end
+    toolQueueBusy = true
+    lua_thread.create(function()
+        local count = item.repeatTake and (item.count or 4) or 1
+        for i = 1, count do
+            if not featureOn(autoTool) or generation ~= toolButtonGeneration or toolNeedsManualTake then break end
+            toolSendRaw(bytes)
+            if i < count then
+                wait(toolRepeatDelayMs)
+            end
+        end
+        if featureOn(autoTool) and generation == toolButtonGeneration then
+            wait(40)
+            toolSendRaw({0x9F, 0xFF, 0xFF})
+        end
+        if generation == toolButtonGeneration then
+            toolQueueBusy = false
         end
     end)
-    if not ok then log(prefix .. " err") end
+end
+
+local function toolProcessOutgoing220(bs)
+    local size = raknetBitStreamGetNumberOfBytesUsed(bs)
+    if size <= 0 then return end
+    raknetBitStreamResetReadPointer(bs)
+    local bytes = {}
+    for i = 1, size do bytes[i] = bit.band(raknetBitStreamReadInt8(bs), 0xFF) end
+    raknetBitStreamResetReadPointer(bs)
+
+    local now = os.clock()
+    local open = (size == 3 and bytes[1] == 0x42 and bytes[2] == 0x65 and bytes[3] == 0x00)
+        or (size == 4 and bytes[1] == 0xDC and bytes[2] == 0x42 and bytes[3] == 0x65 and bytes[4] == 0x00)
+    if open and featureOn(autoTool) and (now - toolLastOpen) > 0.45 then
+        toolLastOpen = now
+        toolRollerWaitAt = 0
+        toolTrunkFlag = true
+    end
+
+    if not featureOn(autoTool) or now < toolIgnoreOutUntil then return end
+    local start = (bytes[1] == 0xDC) and 2 or 1
+    for i = start, size - 12 do
+        if bytes[i] == 0x3F and bytes[i+1] == 0x65 and bytes[i+12] then
+            local code = bytes[i+12]
+            for idx, item in ipairs(TOOL_ITEMS) do
+                if item.code == code then
+                    local wasWaiting = toolNeedsManualTake
+                    toolNeedsManualTake = false
+                    toolSetStage(idx, "manual-pickup")
+                    if item.key == "roller" then
+                        toolRollerWaitAt = os.clock()
+                    end
+                    if wasWaiting then
+                        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап распознан: {00FF88}" .. item.name .. ". Дальше подбор автоматический.", -1)
+                    end
+                    return
+                end
+            end
+        end
+    end
+end
+
+local function toolAdvanceAfterHit()
+    if not featureOn(autoTool) or toolNeedsManualTake or not toolStage then return end
+    local now = os.clock()
+    if now - toolLastHitAt < 0.45 then return end
+    toolLastHitAt = now
+    local nextStage = toolStage + 1
+    if nextStage > #TOOL_ITEMS then return end
+    toolSetStage(nextStage, "fist-hit")
+    if TOOL_ITEMS[nextStage].code then
+        toolStartQueue()
+    end
 end
 
 function onSendPacket(id, bs)
-    if id ~= 220 then return end
-    if not (working or trunk) then return end
-    logBit("OUT", bs)
-end
-
-function onSendChat(text)
-    log("say " .. tostring(text or ""))
-end
-
-local function has(s, a, b)
-    if string.find(s, a, 1, true) then return true end
-    if b and string.find(s, b, 1, true) then return true end
-    return false
+    if id == 220 then
+        toolProcessOutgoing220(bs)
+        return
+    end
 end
 
 local function qty(s)
@@ -720,22 +889,51 @@ end
 local function addFrame(n)
     st.frame = st.frame + n
     mark()
-    log("frame +" .. tostring(n) .. " =" .. tostring(st.frame))
     sampAddChatMessage("{00BFFF}[Road Helper] Frame +" .. n .. " (" .. st.frame .. ")", -1)
 end
 
 local function addOther(n)
     st.chests = st.chests + n
     mark()
-    log("chest +" .. tostring(n) .. " =" .. tostring(st.chests))
     sampAddChatMessage("{00BFFF}[Road Helper] Ларец +" .. n .. " (" .. st.chests .. ")", -1)
 end
 
 -- Только ASCII: storage / Frame / (N — не зависит от CP1251/UTF-8.
--- Если предмет и /storage на разных строках — ждём до 3 сек.
+-- Если предмет и /storage приходят разными строками, сохраняем промежуточное состояние до 3 секунд.
 function onServerMessage(color, text)
     if not text then return end
     local clean = tostring(text):gsub("{%x%x%x%x%x%x}", "")
+
+    -- Этап ремонта определяется только во время общей рабочей сессии СТАРТ.
+    if featureOn(autoTool) then
+        local chatText = clean
+        local converted, utf8Text = pcall(u8, clean)
+        if converted and type(utf8Text) == "string" then
+            chatText = utf8Text
+        end
+        local normalized = toolNormalize(chatText)
+        for _, stage in ipairs(TOOL_CHAT_STAGES) do
+            local phrase = toolNormalize(stage.phrase)
+            if normalized:find(phrase, 1, true) then
+                local idx = toolFindByKey(stage.key)
+                if idx then
+                    toolSetStage(idx, "chat")
+                    if stage.key == "trash" then
+                        -- Сервер сообщил об уборке мусора: выполняем короткий удар.
+                        lua_thread.create(function()
+                            wait(180)
+                            if featureOn(autoTool) and isSampAvailable() and type(setGameKeyState) == "function" then
+                                setGameKeyState(17, true)
+                                wait(120)
+                                setGameKeyState(17, false)
+                            end
+                        end)
+                    end
+                end
+                break
+            end
+        end
+    end
 
     -- Loot/statistics are active only between START and STOP.
     if working then
@@ -775,7 +973,6 @@ function onServerMessage(color, text)
         or string.find(clean, "образовались новые", 1, true)
         or string.find(clean, "Образовались новые", 1, true)
     then
-        log("pits")
         if featureOn(autoRepairs) then
             lua_thread.create(function()
                 wait(300)
@@ -784,7 +981,6 @@ function onServerMessage(color, text)
         end
     end
 end
-
 
 local function drawDigger(dl, x, y, s)
     local function ln(x1, y1, x2, y2)
@@ -805,7 +1001,6 @@ local function drawDigger(dl, x, y, s)
         COL
     )
 end
-
 
 -- Встроенные иконки: при первом запуске скрипт сам создаёт папки и PNG-файлы.
 local iconTextures = {}
@@ -879,22 +1074,25 @@ local function createEmbeddedIcons()
     local root = getWorkingDirectory() .. "/RoadHelper"
     local folder = root .. "/images"
     if not ensureDir(root) then
-        log("cannot create RoadHelper folder; install lfs or create folder manually")
         return folder
     end
     if not ensureDir(folder) then
-        log("cannot create images folder; install lfs or create folder manually")
         return folder
     end
     for name, encoded in pairs(embeddedIcons) do
         local path = folder .. "/" .. name .. ".png"
-        local f = io.open(path, "wb")
-        if f then
-            f:write(decodeBase64(encoded))
-            f:close()
-            log("embedded image updated: " .. name .. ".png")
-        else
-            log("cannot write icon: " .. name .. ".png")
+        local existing = io.open(path, "rb")
+        local valid = false
+        if existing then
+            valid = existing:read(8) == "\137PNG\r\n\26\n"
+            existing:close()
+        end
+        if not valid then
+            local f = io.open(path, "wb")
+            if f then
+                f:write(decodeBase64(encoded))
+                f:close()
+            end
         end
     end
     return folder .. "/"
@@ -903,81 +1101,62 @@ end
 local function loadRoadIcons()
     local base = createEmbeddedIcons()
     for key, file in pairs(iconFiles) do
-        local ok, texture = pcall(function()
-            return imgui.CreateTextureFromFile(base .. file)
-        end)
-        if ok and texture then
-            iconTextures[key] = texture
-            log("icon loaded: " .. file)
-        else
-            iconTextures[key] = nil
-            log("icon texture API unavailable or load failed: " .. file)
+        if not iconTextures[key] then
+            local ok, texture = pcall(function()
+                return imgui.CreateTextureFromFile(base .. file)
+            end)
+            if ok and texture then
+                iconTextures[key] = texture
+            end
         end
     end
     for _, key in ipairs({"start", "stop", "repairs"}) do
-        local ok, texture = pcall(function()
-            return imgui.CreateTextureFromFile(base .. key .. ".png")
+        if not actionTextures[key] then
+            local ok, texture = pcall(function()
+                return imgui.CreateTextureFromFile(base .. key .. ".png")
+            end)
+            actionTextures[key] = (ok and texture) or nil
+        end
+    end
+    if not logoTexture then
+        local okLogo, textureLogo = pcall(function()
+            return imgui.CreateTextureFromFile(base .. "logo.png")
         end)
-        actionTextures[key] = (ok and texture) or nil
-        log((actionTextures[key] and "action image loaded: " or "action image failed: ") .. key .. ".png")
-    end
-    local okLogo, textureLogo = pcall(function()
-        return imgui.CreateTextureFromFile(base .. "logo.png")
-    end)
-    if okLogo and textureLogo then
-        logoTexture = textureLogo
-        log("logo texture loaded: logo.png")
-    else
-        logoTexture = nil
-        log("logo texture failed: logo.png")
+        if okLogo and textureLogo then
+            logoTexture = textureLogo
+        end
     end
 end
 
-local function drawTabIcon(key, size)
-    local texture = iconTextures[key]
-    if texture then
-        local ok = pcall(function() imgui.Image(texture, V2(size, size)) end)
-        if ok then return true end
-    end
-    return false
-end
-
--- Neоновые переключатели настроек (вместо стандартных Checkbox)
+-- Компактный переключатель: одинаковая ширина и единая линия для всех карточек.
 local function settingToggle(label, value, id, banWarning)
     if label and label ~= "" then imgui.Text(u8(label)) end
+    local w, h = 62 * S, 27 * S
+    local banW = 48 * S
+    local pad = imgui.GetStyle().WindowPadding.x
+    local totalW = w + (banWarning and (banW + 6 * S) or 0)
+    imgui.SetCursorPosX(math.max(pad, imgui.GetWindowWidth() - pad - totalW))
     if banWarning then
-        if label and label ~= "" then imgui.SameLine() end
-        imgui.PushStyleColor(imgui.Col.Button, V4(0.55, 0.035, 0.055, 1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.68, 0.045, 0.065, 1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.42, 0.025, 0.04, 1.0))
-        imgui.PushStyleColor(imgui.Col.Text, V4(1.0, 0.88, 0.88, 1.0))
-        imgui.Button(u8("БАН##rh_ban_" .. id), V2(39 * S, 21 * S))
+        imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 7 * S)
+        imgui.PushStyleColor(imgui.Col.Button, V4(0.40, 0.035, 0.065, 1.0))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.62, 0.055, 0.09, 1.0))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.28, 0.02, 0.04, 1.0))
+        imgui.PushStyleColor(imgui.Col.Text, V4(1.0, 0.88, 0.90, 1.0))
+        imgui.Button(u8("BAN##rh_ban_" .. id), V2(banW, h))
         imgui.PopStyleColor(4)
+        imgui.PopStyleVar()
+        imgui.SameLine(0, 6 * S)
     end
-    local w, h = 50 * S, 27 * S
-    local avail = imgui.GetContentRegionAvail()
-    imgui.SetCursorPosX(math.max(0, avail.x - w))
-    local clicked = imgui.Button("##rh_toggle_" .. id, V2(w, h))
-    if clicked then value[0] = not value[0] end
-
-    local p1 = imgui.GetItemRectMin()
-    local p2 = imgui.GetItemRectMax()
-    local dl = imgui.GetWindowDrawList()
-    local cx = value[0] and (p2.x - h * 0.5) or (p1.x + h * 0.5)
-    local cy = (p1.y + p2.y) * 0.5
-    local radius = h * 0.36
-
-    -- Track: белый при включении, фирменный бирюзовый при выключении.
-    local track = value[0] and 0xFFEAF7FF or 0xFFD0B820
-    local knob = value[0] and 0xFF382719 or 0xFF382719
-    pcall(function()
-        dl:AddRectFilled(p1, p2, track, h * 0.5)
-        if value[0] then
-            -- Мягкая светлая кайма вокруг активного белого переключателя.
-            dl:AddCircleFilled(V2(cx, cy), radius + 3 * S, 0x66FFFFFF, 24)
-        end
-        dl:AddCircleFilled(V2(cx, cy), radius, knob, 24)
-    end)
+    local active = value and value[0] == true
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 7 * S)
+    imgui.PushStyleColor(imgui.Col.Button, active and V4(0.035, 0.43, 0.27, 1.0) or V4(0.22, 0.25, 0.29, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, active and V4(0.05, 0.58, 0.35, 1.0) or V4(0.31, 0.35, 0.40, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, active and V4(0.025, 0.32, 0.20, 1.0) or V4(0.16, 0.19, 0.23, 1.0))
+    imgui.PushStyleColor(imgui.Col.Text, V4(1.0, 1.0, 1.0, 1.0))
+    local clicked = imgui.Button((active and u8("ВКЛ") or u8("ВЫКЛ")) .. "##rh_toggle_" .. id, V2(w, h))
+    if clicked and value then value[0] = not active end
+    imgui.PopStyleColor(4)
+    imgui.PopStyleVar()
     return clicked
 end
 
@@ -1000,8 +1179,6 @@ local function actionButton(key, label, id, width, height, textColor)
     pcall(function() dl:AddText(V2(tx, ty), textColor or 0xFFFFFFFF, label) end)
     return clicked
 end
-
-
 
 -- =========================================================
 -- ROAD HELPER OTA UPDATER
@@ -1347,24 +1524,37 @@ end
 
 loadRoadIcons()
 
+-- Shared references for the main menu renderer (keeps LuaJIT upvalues below its 60 limit).
+local RH_MENU_SHARED = {
+    VER = VER,
+    u8 = u8,
+    sizeX = sizeX,
+    sizeY = sizeY,
+    S = S,
+    fmtTime = fmtTime,
+    fmtMoney = fmtMoney,
+    workSec = workSec,
+    totalMoney = totalMoney
+}
+
 imgui.OnFrame(function() return ui.open end, function(self)
     self.HideCursor = false
 
-    local W = math.min(sizeX * 0.95, 780 * S)
-    local H = math.min(sizeY * 0.94, 690 * S)
-    local sideW = math.min(165 * S, W * 0.31)
+    local W = math.min(RH_MENU_SHARED.sizeX * 0.95, 780 * RH_MENU_SHARED.S)
+    local H = math.min(RH_MENU_SHARED.sizeY * 0.94, 690 * RH_MENU_SHARED.S)
+    local sideW = math.min(165 * RH_MENU_SHARED.S, W * 0.31)
 
-    imgui.SetNextWindowPos(V2(sizeX / 2, sizeY / 2), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
+    imgui.SetNextWindowPos(V2(RH_MENU_SHARED.sizeX / 2, RH_MENU_SHARED.sizeY / 2), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
     imgui.SetNextWindowSize(V2(W, H), imgui.Cond.FirstUseEver)
 
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 16 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 12 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 9 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.GrabRounding, 12 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.GrabMinSize, 18 * S)
-    imgui.PushStyleVarFloat(imgui.StyleVar.ScrollbarSize, 6.93 * S)
-    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(10 * S, 10 * S))
-    imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing, V2(7 * S, 7 * S))
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 16 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 12 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 9 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.GrabRounding, 12 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.GrabMinSize, 18 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.ScrollbarSize, 6.93 * RH_MENU_SHARED.S)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(10 * RH_MENU_SHARED.S, 10 * RH_MENU_SHARED.S))
+    imgui.PushStyleVarVec2(imgui.StyleVar.ItemSpacing, V2(7 * RH_MENU_SHARED.S, 7 * RH_MENU_SHARED.S))
 
     local palette = RH_UI_THEMES[ui.theme] or RH_UI_THEMES[1]
     imgui.PushStyleColor(imgui.Col.WindowBg, RH_themeColor(palette.window))
@@ -1383,27 +1573,26 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PushStyleColor(imgui.Col.TitleBg, RH_themeColor(palette.title))
     imgui.PushStyleColor(imgui.Col.TitleBgActive, RH_themeColor(palette.titleActive))
 
-    imgui.Begin(u8"##road_helper_main", nil, imgui.WindowFlags.NoCollapse)
+    imgui.Begin(RH_MENU_SHARED.u8("##road_helper_main"), nil, imgui.WindowFlags.NoCollapse)
 
     -- Левая навигация. Иконки рисуются линиями, поэтому не зависят от шрифта.
     imgui.BeginChild("##side", V2(sideW, 0), true)
     local side = imgui.GetWindowDrawList()
     local sp = imgui.GetCursorScreenPos()
     local avail = imgui.GetContentRegionAvail()
-    imgui.Dummy(V2(1, 3 * S))
-    local logoW = math.min(132 * S, avail.x - 8)
+    imgui.Dummy(V2(1, 3 * RH_MENU_SHARED.S))
+    local logoW = math.min(132 * RH_MENU_SHARED.S, avail.x - 8)
     local logoH = logoW * 0.66
     if logoTexture then
         imgui.SetCursorPosX((avail.x - logoW) * 0.5)
         imgui.Image(logoTexture, V2(logoW, logoH))
     else
-        imgui.Dummy(V2(avail.x, 72 * S))
-        log("reference worker logo texture unavailable")
+        imgui.Dummy(V2(avail.x, 72 * RH_MENU_SHARED.S))
     end
-    imgui.Dummy(V2(1, 5 * S))
+    imgui.Dummy(V2(1, 5 * RH_MENU_SHARED.S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = u8"Road Helper v1.3"
+    local sideText = RH_MENU_SHARED.u8("Road Helper v1.4")
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -1413,11 +1602,11 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Spacing()
 
     local tabs = {
-        {u8"ГЛАВНАЯ", 1, "home"},
-        {u8"ФУНКЦИИ", 2, "settings"},
-        {u8"СТАТИСТИКА", 3, "statistics"},
-        {u8"НАСТРОЙКИ", 4, "buttons"},
-        {u8"АВТОР", 5, "author"}
+        {RH_MENU_SHARED.u8("ГЛАВНАЯ"), 1, "home"},
+        {RH_MENU_SHARED.u8("ФУНКЦИИ"), 2, "settings"},
+        {RH_MENU_SHARED.u8("СТАТИСТИКА"), 3, "statistics"},
+        {RH_MENU_SHARED.u8("НАСТРОЙКИ"), 4, "buttons"},
+        {RH_MENU_SHARED.u8("АВТОР"), 5, "author"}
     }
     for _, tab in ipairs(tabs) do
         local selected = (ui.tab == tab[2])
@@ -1429,7 +1618,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         -- поверх кнопки слева и центрируется по вертикали внутри неё.
         local clicked
         if tab[3] == "buttons" then
-            clicked = imgui.Button("##rh_tab_settings", V2(-1, 42 * S))
+            clicked = imgui.Button("##rh_tab_settings", V2(-1, 42 * RH_MENU_SHARED.S))
             local pMin = imgui.GetItemRectMin()
             local pMax = imgui.GetItemRectMax()
             local labelSize = imgui.CalcTextSize(tab[1])
@@ -1437,14 +1626,14 @@ imgui.OnFrame(function() return ui.open end, function(self)
             local labelY = pMin.y + ((pMax.y - pMin.y) - labelSize.y) * 0.5
             imgui.GetWindowDrawList():AddText(V2(labelX, labelY), 0xFFFFFFFF, tab[1])
         else
-            clicked = imgui.Button(tab[1], V2(-1, 42 * S))
+            clicked = imgui.Button(tab[1], V2(-1, 42 * RH_MENU_SHARED.S))
         end
         local iconTexture = iconTextures[tab[3]]
         if iconTexture then
             local pMin = imgui.GetItemRectMin()
             local pMax = imgui.GetItemRectMax()
-            local iconSize = 26 * S
-            local iconOffset = tab[3] == "statistics" and -3 * S or (tab[3] == "buttons" and 5 * S or 9 * S)
+            local iconSize = 26 * RH_MENU_SHARED.S
+            local iconOffset = tab[3] == "statistics" and -3 * RH_MENU_SHARED.S or (tab[3] == "buttons" and 5 * RH_MENU_SHARED.S or 9 * RH_MENU_SHARED.S)
             local iconX = pMin.x + iconOffset
             local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5
             pcall(function()
@@ -1459,12 +1648,12 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Spacing()
     imgui.Separator()
     imgui.Spacing()
-    if imgui.Button(u8"ЗАКРЫТЬ МЕНЮ", V2(-1, 40 * S)) then
+    if imgui.Button(RH_MENU_SHARED.u8("ЗАКРЫТЬ МЕНЮ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
         ui.open = false
         saveCfg()
     end
     imgui.Spacing()
-    imgui.TextDisabled(u8"ANDROID / NEOMLOADER")
+    imgui.TextDisabled(RH_MENU_SHARED.u8("ANDROID / NEOMLOADER"))
     imgui.EndChild()
 
     imgui.SameLine()
@@ -1491,51 +1680,51 @@ imgui.OnFrame(function() return ui.open end, function(self)
     end
 
     local headers = {
-        u8"ПАНЕЛЬ УПРАВЛЕНИЯ",
-        u8"ИГРОВЫЕ ФУНКЦИИ",
-        u8"СТАТИСТИКА РАБОТЫ",
-        u8"НАСТРОЙКИ ПРИЛОЖЕНИЯ",
-        u8"ИНФОРМАЦИЯ О ПРОЕКТЕ"
+        RH_MENU_SHARED.u8("ПАНЕЛЬ УПРАВЛЕНИЯ"),
+        RH_MENU_SHARED.u8("ИГРОВЫЕ ФУНКЦИИ"),
+        RH_MENU_SHARED.u8("СТАТИСТИКА РАБОТЫ"),
+        RH_MENU_SHARED.u8("НАСТРОЙКИ ПРИЛОЖЕНИЯ"),
+        RH_MENU_SHARED.u8("ИНФОРМАЦИЯ О ПРОЕКТЕ")
     }
     imgui.SetWindowFontScale(1.12)
-    imgui.TextColored(RH_themeColor(palette.accent), headers[ui.tab] or u8"ROAD HELPER")
+    imgui.TextColored(RH_themeColor(palette.accent), headers[ui.tab] or RH_MENU_SHARED.u8("ROAD HELPER"))
     imgui.SetWindowFontScale(1.0)
     imgui.Separator()
     imgui.Spacing()
 
     if ui.tab == 1 then
-        imgui.TextDisabled(u8"УПРАВЛЕНИЕ И БЫСТРЫЙ ДОСТУП")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("УПРАВЛЕНИЕ И БЫСТРЫЙ ДОСТУП"))
         imgui.Spacing()
 
         -- Статусная панель в стиле предоставленного образца
         if working then
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.018, 0.115, 0.095, 1.0))
-            imgui.BeginChild("##home_status", V2(-1, 82 * S), true)
-            imgui.TextColored(V4(0.20, 1.00, 0.56, 1), u8"●  РАБОТАЕТ")
-            imgui.Text(u8"Работа начата  |  Время: " .. fmtTime(workSec()))
+            imgui.BeginChild("##home_status", V2(-1, 82 * RH_MENU_SHARED.S), true)
+            imgui.TextColored(V4(0.20, 1.00, 0.56, 1), RH_MENU_SHARED.u8("●  РАБОТАЕТ"))
+            imgui.Text(RH_MENU_SHARED.u8("Работа начата  |  Время: ") .. RH_MENU_SHARED.fmtTime(RH_MENU_SHARED.workSec()))
             imgui.EndChild()
             imgui.PopStyleColor()
         else
             imgui.PushStyleColor(imgui.Col.ChildBg, V4(0.105, 0.045, 0.065, 1.0))
-            imgui.BeginChild("##home_status", V2(-1, 82 * S), true)
-            imgui.TextColored(V4(1.00, 0.39, 0.47, 1), u8"●  ОСТАНОВЛЕН")
-            imgui.TextDisabled(u8"Нажми «СТАРТ», чтобы начать отсчёт работы")
+            imgui.BeginChild("##home_status", V2(-1, 82 * RH_MENU_SHARED.S), true)
+            imgui.TextColored(V4(1.00, 0.39, 0.47, 1), RH_MENU_SHARED.u8("●  ОСТАНОВЛЕН"))
+            imgui.TextDisabled(RH_MENU_SHARED.u8("Нажми «СТАРТ», чтобы начать отсчёт работы"))
             imgui.EndChild()
             imgui.PopStyleColor()
         end
 
         imgui.Spacing()
-        local actionW = (imgui.GetContentRegionAvail().x - 8 * S) * 0.5
+        local actionW = (imgui.GetContentRegionAvail().x - 8 * RH_MENU_SHARED.S) * 0.5
         imgui.PushStyleColor(imgui.Col.Button, V4(0.015, 0.34, 0.23, 1))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.025, 0.48, 0.31, 1))
-        if actionButton("start", u8"СТАРТ", "road_start", actionW, 48 * S, 0xFFFFFFFF) then
+        if actionButton("start", RH_MENU_SHARED.u8("СТАРТ"), "road_start", actionW, 48 * RH_MENU_SHARED.S, 0xFFFFFFFF) then
             if not working then setWork(true) end
         end
         imgui.PopStyleColor(2)
         imgui.SameLine()
         imgui.PushStyleColor(imgui.Col.Button, V4(0.40, 0.075, 0.105, 1))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.58, 0.10, 0.14, 1))
-        if actionButton("stop", u8"СТОП", "road_stop", actionW, 48 * S, 0xFFFFFFFF) then
+        if actionButton("stop", RH_MENU_SHARED.u8("СТОП"), "road_stop", actionW, 48 * RH_MENU_SHARED.S, 0xFFFFFFFF) then
             if working then setWork(false) end
         end
         imgui.PopStyleColor(2)
@@ -1544,7 +1733,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.20, 0.36, 1))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.035, 0.31, 0.52, 1))
         local repairsButtonW = imgui.GetContentRegionAvail().x
-        if actionButton("repairs", u8"МЕСТА РЕМОНТА", "road_repairs", repairsButtonW, 44 * S, 0xFFFFFFFF) then
+        if actionButton("repairs", RH_MENU_SHARED.u8("МЕСТА РЕМОНТА"), "road_repairs", repairsButtonW, 44 * RH_MENU_SHARED.S, 0xFFFFFFFF) then
             repairsAt = 0
             openRepairs()
         end
@@ -1552,99 +1741,122 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         imgui.Spacing()
         imgui.Separator()
-        imgui.TextColored(V4(0.20, 0.72, 1.00, 1), u8"ТЕКУЩАЯ СТАТИСТИКА")
+        imgui.TextColored(V4(0.20, 0.72, 1.00, 1), RH_MENU_SHARED.u8("ТЕКУЩАЯ СТАТИСТИКА"))
         imgui.Spacing()
 
         -- Компактная сетка 2x2 хорошо помещается и на мобильном экране.
-        local cardW = (imgui.GetContentRegionAvail().x - 8 * S) * 0.5
-        imgui.BeginChild("##home_time", V2(cardW, 66 * S), true)
-        imgui.TextDisabled(u8"ВРЕМЯ РАБОТЫ")
-        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), fmtTime(workSec()))
+        local cardW = (imgui.GetContentRegionAvail().x - 8 * RH_MENU_SHARED.S) * 0.5
+        imgui.BeginChild("##home_time", V2(cardW, 66 * RH_MENU_SHARED.S), true)
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ВРЕМЯ РАБОТЫ"))
+        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), RH_MENU_SHARED.fmtTime(RH_MENU_SHARED.workSec()))
         imgui.EndChild()
         imgui.SameLine()
-        imgui.BeginChild("##home_money", V2(-1, 66 * S), true)
-        imgui.TextDisabled(u8"ДЕНЬГИ С СИСТЕМЫ")
-        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), fmtMoney(st.money))
+        imgui.BeginChild("##home_money", V2(-1, 66 * RH_MENU_SHARED.S), true)
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ДЕНЬГИ С СИСТЕМЫ"))
+        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), RH_MENU_SHARED.fmtMoney(st.money))
         imgui.EndChild()
 
-        imgui.BeginChild("##home_frame", V2(cardW, 66 * S), true)
-        imgui.TextDisabled(u8"КЕЙСЫ FRAME")
-        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), tostring(st.frame) .. u8" шт.")
-        imgui.TextDisabled(fmtMoney(st.frame * casePrice[0]))
+        imgui.BeginChild("##home_frame", V2(cardW, 66 * RH_MENU_SHARED.S), true)
+        imgui.TextDisabled(RH_MENU_SHARED.u8("КЕЙСЫ FRAME"))
+        imgui.TextColored(V4(0.70, 0.88, 1.00, 1), tostring(st.frame) .. RH_MENU_SHARED.u8(" шт."))
+        imgui.TextDisabled(RH_MENU_SHARED.fmtMoney(st.frame * casePrice[0]))
         imgui.EndChild()
         imgui.SameLine()
-        imgui.BeginChild("##home_total", V2(-1, 66 * S), true)
-        imgui.TextDisabled(u8"ОБЩИЙ ЗАРАБОТОК")
-        imgui.TextColored(V4(0.18, 0.96, 0.64, 1), fmtMoney(totalMoney()))
+        imgui.BeginChild("##home_total", V2(-1, 66 * RH_MENU_SHARED.S), true)
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ОБЩИЙ ЗАРАБОТОК"))
+        imgui.TextColored(V4(0.18, 0.96, 0.64, 1), RH_MENU_SHARED.fmtMoney(RH_MENU_SHARED.totalMoney()))
         imgui.EndChild()
 
         imgui.Spacing()
-        imgui.TextDisabled(u8"Цена одного Frame: " .. fmtMoney(casePrice[0]))
-        imgui.TextDisabled(u8"Учитываются ларцы и кейсы из уведомлений хранилища.")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Цена одного Frame: ") .. RH_MENU_SHARED.fmtMoney(casePrice[0]))
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Учитываются ларцы и кейсы из уведомлений хранилища."))
 
     elseif ui.tab == 2 then
-        -- Премиум Dark Neon: отдельные карточки с описаниями и предупреждениями.
-        local function settingsCard(id, title, description, value, banWarning, onChanged)
-            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
-            imgui.BeginChild("##settings_card_" .. id, V2(-1, 92 * S), true)
-            local cardW = imgui.GetContentRegionAvail().x
-            imgui.BeginChild("##settings_info_" .. id, V2(cardW * 0.70, -1), false)
-            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
-            imgui.TextDisabled(u8(description))
-            imgui.EndChild()
-            imgui.SameLine()
-            imgui.BeginChild("##settings_switch_" .. id, V2(0, -1), false)
-            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
-            if settingToggle("", value, id, banWarning) then
-                if onChanged then onChanged() else mark() end
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ВЫБЕРИ ФУНКЦИЮ — ЕЁ ОПИСАНИЕ И ПЕРЕКЛЮЧАТЕЛЬ ПОЯВЯТСЯ НИЖЕ"))
+        imgui.Spacing()
+
+        local functionsList = {
+            { short = "КАПЧА", title = "АВТОКАПЧА", card = "Распознаёт игровое окно капчи и выполняет необходимые нажатия.", desc = "Когда сервер открывает интерфейс капчи, хелпер автоматически отмечает клетки и отправляет подтверждение. Для работы включи функцию и общий режим СТАРТ. Если капча не появилась, функция ничего не делает. Автоматизация игровых проверок может противоречить правилам сервера и не гарантирует отсутствие санкций.", flag = autoCaptcha, id = "auto_captcha", warning = true },
+            { short = "КЛИК", title = "АВТОКЛИК", card = "Нажимает на элемент мини-игры, пока сервер считает её активной.", desc = "Отправляет нажатия только во время распознанной мини-игры. Как только сервер закрывает мини-игру, автоклик прекращается. Включи функцию и общий режим СТАРТ. Частота нажатий задаётся внутренней задержкой скрипта; функция не должна работать вне активной мини-игры.", flag = autoClick, id = "auto_click", warning = true },
+            { short = "ЗАКАЗ · БЕТА", title = "АВТОЗАКАЗ · БЕТА", card = "БЕТА-ТЕСТ: автоматически находит ближайшее происшествие и выбирает его в списке.", desc = "БЕТА-ТЕСТИРОВАНИЕ. Функция автоматически обрабатывает список /repairs, сопоставляет названия и координаты известных мест и выбирает ближайшее происшествие. Возможны баги, ошибки и недоработки; работа не гарантируется на всех ситуациях. Если нашли баг, сообщите в Telegram-канал автора или напишите на Arizona Mods. Для автономного цикла включите также «Автооткрытие происшествий».", flag = RH_ORDER.enabled, id = "auto_take_order" },
+            { short = "ИНСТР. · БЕТА", title = "ИНСТРУМЕНТ · БЕТА", card = "БЕТА-ТЕСТ: распознаёт этапы ремонта и подбирает инструменты из багажника.", desc = "БЕТА-ТЕСТИРОВАНИЕ. После включения хелпер ждёт сообщение сервера об этапе или первое ручное взятие инструмента. Затем пытается автоматически выбирать нужные инструменты. Возможны баги, ошибки и недоработки; отдельные действия могут требовать участия игрока. Если нашли баг, сообщите в Telegram-канал автора или напишите на Arizona Mods. При выключении этап и очередь сбрасываются.", flag = autoTool, id = "auto_tool", warning = true, onChanged = function() toolSetEnabled(autoTool[0]) end },
+            { short = "/REP", title = "АВТООТКРЫТИЕ ПРОИСШЕСТВИЙ", card = "Открывает список происшествий, когда сервер сообщает о новых ямах.", desc = "Отслеживает серверные сообщения о появлении новых ям и через небольшую задержку отправляет /repairs. Работает только после включения общего режима СТАРТ. Для полностью автономного цикла используй вместе с функцией «Автозаказ»: эта функция открывает список, а Автозаказ выбирает ближайшее происшествие.", flag = autoRepairs, id = "auto_repairs" },
+            { short = "ФЛИП", title = "АВТОФЛИП", card = "После переворота автомобиля с задержкой отправляет /domkrat.", desc = "Проверяет положение автомобиля. Если он перевёрнут, запускается таймер; по его окончании отправляется /domkrat. Когда автомобиль возвращается в нормальное положение, таймер и состояние срабатывания сбрасываются. Задержка настраивается в подробной информации функции.", flag = autoFlip, id = "auto_flip", onChanged = function() flipT, flipped = nil, false end },
+            { short = "ЛОК", title = "АВТОЛОК", card = "Управляет замком, ключом и двигателем при посадке и выходе.", desc = "При посадке в автомобиль после ожидания отправляет /lock, /key и /engine. При выходе проверяет состояние замка и при необходимости закрывает автомобиль; затем при соответствующих условиях отправляет /key. Все действия выполняются только при активном общем режиме СТАРТ и включённом Автолоке.", flag = autoLock, id = "auto_lock" },
+            { short = "ФУЛЛ", title = "АВТОФУЛЛ", card = "Рассчитывает недостающее топливо и запускает дозаправку.", desc = "Обрабатывает интерфейс заправки, определяет выбранный тип топлива, максимальный и текущий объём, затем запрашивает недостающее количество до полного бака. При выключении функции или нажатии СТОП отложенные действия отменяются. Требуется поддерживаемый интерфейс заправки сервера.", flag = autoFill, id = "auto_fill", onChanged = function() autoFillGeneration = autoFillGeneration + 1 end }
+        }
+
+        -- Каждая функция — отдельная карточка с собственным переключателем.
+        local functionCardGap = 8 * RH_MENU_SHARED.S
+        local functionCardW = (imgui.GetContentRegionAvail().x - functionCardGap * 3) / 4
+        local functionCardH = 280 * RH_MENU_SHARED.S
+        for i, item in ipairs(functionsList) do
+            if (i - 1) % 4 ~= 0 then
+                imgui.SameLine(0, functionCardGap)
+            end
+            local chosen = ui.functionIndex == i
+            if chosen then
+                imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
+                imgui.PushStyleColor(imgui.Col.Border, RH_themeColor(palette.accent))
+            else
+                imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
+            end
+            imgui.BeginChild("##function_pick_" .. i, V2(functionCardW, functionCardH), true)
+            imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8(item.short))
+            imgui.Separator()
+            imgui.TextWrapped(RH_MENU_SHARED.u8(item.card))
+            imgui.Spacing()
+            imgui.TextDisabled(RH_MENU_SHARED.u8(item.title))
+            imgui.Spacing()
+            -- Фиксированная высота переключателя: все четыре карточки
+            -- в каждом ряду имеют одинаковое расположение кнопки ВКЛ/ВЫКЛ.
+            imgui.SetCursorPosY(176 * RH_MENU_SHARED.S)
+            if settingToggle("", item.flag, item.id, item.warning) then
+                if item.onChanged then item.onChanged() end
+                mark()
+                saveCfg()
+            end
+            imgui.SetCursorPosY(226 * RH_MENU_SHARED.S)
+            if imgui.Button(RH_MENU_SHARED.u8("ПОДРОБНЕЕ"), V2(-1, 30 * RH_MENU_SHARED.S)) then
+                ui.functionIndex = i
+                ui.functionPopupData = item
+                functionPopupOpen[0] = true
             end
             imgui.EndChild()
-            imgui.EndChild()
-            imgui.PopStyleColor()
-            imgui.Spacing()
+            if chosen then imgui.PopStyleColor(2) else imgui.PopStyleColor() end
         end
 
-        imgui.TextDisabled(u8"ИГРОВЫЕ ФУНКЦИИ / AUTOMATION")
         imgui.Spacing()
-        settingsCard("auto_click", "АВТОКЛИКЕР МИНИ-ИГРЫ", "Автоматически нажимает, пока заполняется круг мини-игры.", autoClick, true)
-        settingsCard("auto_captcha", "АВТОКАПЧА", "Распознаёт и помогает проходить появляющуюся капчу.", autoCaptcha, true)
-        settingsCard("auto_repairs", "АВТОМАТИЧЕСКИЙ /REPAIRS", "Автоматически открывает список доступных мест ремонта.", autoRepairs, false)
-        settingsCard("auto_flip", "АВТОФЛИП", "Автоматически переворачивает автомобиль при необходимости.", autoFlip, false, function()
-            mark()
-            flipT, flipped = nil, false
-        end)
-        settingsCard("auto_lock", "АВТО ЛОК", "Закрывает автомобиль и выполняет команды при посадке/выходе.", autoLock, false)
-        settingsCard("auto_fill", "АВТОФУЛЛ", "Автоматически заправляет автомобиль на АЗС.", autoFill, false)
-        settingsCard("auto_take_order", "АВТОВЗЯТИЕ ПРОИСШЕСТВИЯ", "Выбирает ближайшее происшествие из списка /repairs по координатам.", RH_ORDER.enabled, false)
+        imgui.Separator()
+        imgui.Spacing()
 
-        -- Задержка AutoFlip оставлена внутренней (0.75 сек.), отдельный ползунок убран,
-        -- чтобы переключатель AutoFlip был доступен без прокрутки.
-        imgui.TextDisabled(u8"Изменения сохраняются автоматически.")
-        if imgui.Button(u8"СОХРАНИТЬ НАСТРОЙКИ", V2(-1, 40 * S)) then
+        imgui.Spacing()
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Все автоматические действия доступны только после СТАРТ. Кнопка СТОП останавливает автоматизацию."))
+        if imgui.Button(RH_MENU_SHARED.u8("СОХРАНИТЬ НАСТРОЙКИ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
             saveCfg()
             sampAddChatMessage("{00BFFF}[Road Helper] Сохранено", -1)
         end
 
     elseif ui.tab == 4 then
-        imgui.TextDisabled(u8"НАСТРОЙКИ ПРИЛОЖЕНИЯ")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("НАСТРОЙКИ ПРИЛОЖЕНИЯ"))
         imgui.Spacing()
-        local subW = (imgui.GetContentRegionAvail().x - 8 * S) * 0.5
+        local subW = (imgui.GetContentRegionAvail().x - 8 * RH_MENU_SHARED.S) * 0.5
         if ui.settingsPage == 1 then
             imgui.PushStyleColor(imgui.Col.Button, RH_themeColor(palette.active))
         end
-        if imgui.Button(u8"КНОПКИ", V2(subW, 40 * S)) then ui.settingsPage = 1 end
+        if imgui.Button(RH_MENU_SHARED.u8("КНОПКИ"), V2(subW, 40 * RH_MENU_SHARED.S)) then ui.settingsPage = 1 end
         if ui.settingsPage == 1 then imgui.PopStyleColor() end
         imgui.SameLine()
         if ui.settingsPage == 2 then imgui.PushStyleColor(imgui.Col.Button, RH_themeColor(palette.active)) end
-        if imgui.Button(u8"ИНТЕРФЕЙС", V2(-1, 40 * S)) then ui.settingsPage = 2 end
+        if imgui.Button(RH_MENU_SHARED.u8("ИНТЕРФЕЙС"), V2(-1, 40 * RH_MENU_SHARED.S)) then ui.settingsPage = 2 end
         if ui.settingsPage == 2 then imgui.PopStyleColor() end
         imgui.Spacing()
         imgui.Separator()
         imgui.Spacing()
 
         if ui.settingsPage == 2 then
-            imgui.TextColored(RH_themeColor(palette.accent), u8"ВЫБОР ОФОРМЛЕНИЯ")
-            imgui.TextDisabled(u8"Выбери цветовую тему главного окна Road Helper.")
+            imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8("ВЫБОР ОФОРМЛЕНИЯ"))
+            imgui.TextDisabled(RH_MENU_SHARED.u8("Выбери цветовую тему главного окна Road Helper."))
             imgui.Spacing()
             local themeDescriptions = {
                 "Тёмно-синяя основа и голубые неоновые акценты.",
@@ -1659,18 +1871,18 @@ imgui.OnFrame(function() return ui.open end, function(self)
                 else
                     imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
                 end
-                imgui.BeginChild("##rh_theme_" .. i, V2(-1, 92 * S), true)
+                imgui.BeginChild("##rh_theme_" .. i, V2(-1, 92 * RH_MENU_SHARED.S), true)
                 local themeCardW = imgui.GetContentRegionAvail().x
                 imgui.BeginChild("##rh_theme_info_" .. i, V2(themeCardW * 0.68, -1), false)
-                imgui.TextColored(RH_themeColor(RH_UI_THEMES[i].accent), u8(th.name))
-                imgui.TextDisabled(u8(themeDescriptions[i]))
+                imgui.TextColored(RH_themeColor(RH_UI_THEMES[i].accent), RH_MENU_SHARED.u8(th.name))
+                imgui.TextDisabled(RH_MENU_SHARED.u8(themeDescriptions[i]))
                 imgui.EndChild()
                 imgui.SameLine()
                 imgui.BeginChild("##rh_theme_action_" .. i, V2(0, -1), false)
-                imgui.SetCursorPosY((imgui.GetWindowHeight() - 38 * S) * 0.5)
+                imgui.SetCursorPosY((imgui.GetWindowHeight() - 38 * RH_MENU_SHARED.S) * 0.5)
                 if chosen then
-                    imgui.TextColored(RH_themeColor(palette.accent), u8"ВЫБРАНА")
-                elseif imgui.Button(u8"ПРИМЕНИТЬ##theme" .. i, V2(-1, 38 * S)) then
+                    imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8("ВЫБРАНА"))
+                elseif imgui.Button(RH_MENU_SHARED.u8("ПРИМЕНИТЬ##theme") .. i, V2(-1, 38 * RH_MENU_SHARED.S)) then
                     ui.theme = i
                     mark()
                     saveCfg()
@@ -1680,27 +1892,27 @@ imgui.OnFrame(function() return ui.open end, function(self)
                 if chosen then imgui.PopStyleColor(2) else imgui.PopStyleColor() end
                 imgui.Spacing()
             end
-            imgui.TextDisabled(u8"Выбранная тема сохраняется автоматически и останется после перезапуска.")
-            if imgui.Button(u8"ВОЗВРАТ К СТАНДАРТНОЙ ТЕМЕ", V2(-1, 40 * S)) then
+            imgui.TextDisabled(RH_MENU_SHARED.u8("Выбранная тема сохраняется автоматически и останется после перезапуска."))
+            if imgui.Button(RH_MENU_SHARED.u8("ВОЗВРАТ К СТАНДАРТНОЙ ТЕМЕ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
                 ui.theme = 1
                 mark()
                 saveCfg()
             end
         else
-        imgui.TextDisabled(u8"ВНЕШНИЙ ВИД И РАСПОЛОЖЕНИЕ ЭЛЕМЕНТОВ")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ВНЕШНИЙ ВИД И РАСПОЛОЖЕНИЕ ЭЛЕМЕНТОВ"))
         imgui.Spacing()
 
         local function buttonSettingsCard(id, title, description, enabled, toggleId)
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
-            imgui.BeginChild("##button_card_" .. id, V2(-1, 92 * S), true)
+            imgui.BeginChild("##button_card_" .. id, V2(-1, 92 * RH_MENU_SHARED.S), true)
             local cardW = imgui.GetContentRegionAvail().x
             imgui.BeginChild("##button_info_" .. id, V2(cardW * 0.70, -1), false)
-            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
-            imgui.TextDisabled(u8(description))
+            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), RH_MENU_SHARED.u8(title))
+            imgui.TextDisabled(RH_MENU_SHARED.u8(description))
             imgui.EndChild()
             imgui.SameLine()
             imgui.BeginChild("##button_switch_" .. id, V2(0, -1), false)
-            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
+            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * RH_MENU_SHARED.S) * 0.5)
             if settingToggle("", enabled, toggleId) then mark() end
             imgui.EndChild()
             imgui.EndChild()
@@ -1711,14 +1923,14 @@ imgui.OnFrame(function() return ui.open end, function(self)
         buttonSettingsCard("control", "КНОПКА СТАРТ / СТОП", "Показывать плавающую кнопку управления работой.", showCtrl, "show_ctrl")
         if showCtrl[0] then
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
-            imgui.BeginChild("##button_control_values", V2(-1, 150 * S), true)
-            imgui.Text(u8"Положение X")
-            if imgui.SliderInt("##cpx", ctrlX, 0, math.max(0, sizeX - 50)) then mark() end
-            imgui.Text(u8"Положение Y")
-            if imgui.SliderInt("##cpy", ctrlY, 0, math.max(0, sizeY - 50)) then mark() end
-            imgui.Text(u8"Ширина")
+            imgui.BeginChild("##button_control_values", V2(-1, 150 * RH_MENU_SHARED.S), true)
+            imgui.Text(RH_MENU_SHARED.u8("Положение X"))
+            if imgui.SliderInt("##cpx", ctrlX, 0, math.max(0, RH_MENU_SHARED.sizeX - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Положение Y"))
+            if imgui.SliderInt("##cpy", ctrlY, 0, math.max(0, RH_MENU_SHARED.sizeY - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Ширина"))
             if imgui.SliderInt("##cw", ctrlW, 100, 300) then mark() end
-            imgui.Text(u8"Высота")
+            imgui.Text(RH_MENU_SHARED.u8("Высота"))
             if imgui.SliderInt("##ch", ctrlH, 36, 80) then mark() end
             imgui.EndChild()
             imgui.PopStyleColor()
@@ -1728,69 +1940,89 @@ imgui.OnFrame(function() return ui.open end, function(self)
         buttonSettingsCard("repairs", "КНОПКА МЕСТА РЕМОНТА", "Показывать плавающую кнопку быстрого доступа к местам ремонта.", showRep, "show_rep")
         if showRep[0] then
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
-            imgui.BeginChild("##button_repairs_values", V2(-1, 150 * S), true)
-            imgui.Text(u8"Положение X")
-            if imgui.SliderInt("##rpx", repX, 0, math.max(0, sizeX - 50)) then mark() end
-            imgui.Text(u8"Положение Y")
-            if imgui.SliderInt("##rpy", repY, 0, math.max(0, sizeY - 50)) then mark() end
-            imgui.Text(u8"Ширина")
+            imgui.BeginChild("##button_repairs_values", V2(-1, 150 * RH_MENU_SHARED.S), true)
+            imgui.Text(RH_MENU_SHARED.u8("Положение X"))
+            if imgui.SliderInt("##rpx", repX, 0, math.max(0, RH_MENU_SHARED.sizeX - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Положение Y"))
+            if imgui.SliderInt("##rpy", repY, 0, math.max(0, RH_MENU_SHARED.sizeY - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Ширина"))
             if imgui.SliderInt("##rw", repW, 100, 300) then mark() end
-            imgui.Text(u8"Высота")
+            imgui.Text(RH_MENU_SHARED.u8("Высота"))
             if imgui.SliderInt("##rh", repH, 36, 80) then mark() end
             imgui.EndChild()
             imgui.PopStyleColor()
         end
         imgui.Spacing()
-        imgui.TextDisabled(u8"Зажми плавающую кнопку на 0.4 сек. и перетащи пальцем.")
-        if imgui.Button(u8"СОХРАНИТЬ ПОЛОЖЕНИЕ КНОПОК", V2(-1, 40 * S)) then
+        buttonSettingsCard("tool_button", "КНОПКА ИНСТРУМЕНТ", "Отдельное включение и выключение автоматического подбора инструмента.", showToolButton, "show_tool_button")
+        if showToolButton[0] then
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
+            imgui.BeginChild("##button_tool_values", V2(-1, 150 * RH_MENU_SHARED.S), true)
+            imgui.Text(RH_MENU_SHARED.u8("Положение X"))
+            if imgui.SliderInt("##tpx", toolX, 0, math.max(0, RH_MENU_SHARED.sizeX - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Положение Y"))
+            if imgui.SliderInt("##tpy", toolY, 0, math.max(0, RH_MENU_SHARED.sizeY - 50)) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Ширина"))
+            if imgui.SliderInt("##tw", toolW, 100, 300) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Высота"))
+            if imgui.SliderInt("##th", toolH, 36, 80) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
+        end
+        imgui.Spacing()
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Зажми плавающую кнопку на 0.4 сек. и перетащи пальцем."))
+        if imgui.Button(RH_MENU_SHARED.u8("СОХРАНИТЬ ПОЛОЖЕНИЕ КНОПОК"), V2(-1, 40 * RH_MENU_SHARED.S)) then
             saveCfg()
             sampAddChatMessage("{00BFFF}[Road Helper] Кнопки сохранены", -1)
         end
         end -- ui.settingsPage
 
     elseif ui.tab == 3 then
-        imgui.TextDisabled(u8"РЕЗУЛЬТАТЫ ТЕКУЩЕЙ РАБОТЫ")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("РЕЗУЛЬТАТЫ ТЕКУЩЕЙ РАБОТЫ"))
         imgui.Spacing()
 
+        local statCardIndex = 0
+        local statGridGap = 8 * RH_MENU_SHARED.S
+        local statGridW = (imgui.GetContentRegionAvail().x - statGridGap * 3) / 4
+        local statCardH = 204 * RH_MENU_SHARED.S
         local function statToggleCard(id, title, description, value)
+            statCardIndex = statCardIndex + 1
+            if (statCardIndex - 1) % 4 ~= 0 then
+                imgui.SameLine(0, statGridGap)
+            end
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
-            imgui.BeginChild("##stat_card_" .. id, V2(-1, 92 * S), true)
-            local cardW = imgui.GetContentRegionAvail().x
-            imgui.BeginChild("##stat_info_" .. id, V2(cardW * 0.70, -1), false)
-            imgui.TextColored(V4(0.92, 0.97, 1.00, 1.0), u8(title))
-            imgui.TextDisabled(u8(description))
-            imgui.EndChild()
-            imgui.SameLine()
-            imgui.BeginChild("##stat_switch_" .. id, V2(0, -1), false)
-            imgui.SetCursorPosY((imgui.GetWindowHeight() - 52 * S) * 0.5)
+            imgui.BeginChild("##stat_card_" .. id, V2(statGridW, statCardH), true)
+            imgui.TextWrapped(RH_MENU_SHARED.u8(title))
+            imgui.Separator()
+            imgui.TextWrapped(RH_MENU_SHARED.u8(description))
+            -- Переключатель закреплён внизу увеличенной карточки, чтобы описание не наезжало на него.
+            imgui.SetCursorPosY(math.max(imgui.GetCursorPosY() + 5 * RH_MENU_SHARED.S, 158 * RH_MENU_SHARED.S))
             if settingToggle("", value, id) then mark() end
             imgui.EndChild()
-            imgui.EndChild()
             imgui.PopStyleColor()
-            imgui.Spacing()
         end
 
         statToggleCard("show_stats", "ОКНО СТАТИСТИКИ", "Показывать отдельное плавающее окно статистики.", showStats)
-        if showStats[0] then
-            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
-            imgui.BeginChild("##stat_dimensions", V2(-1, 86 * S), true)
-            imgui.Text(u8"Ширина окна")
-            if imgui.SliderInt("##sw", statW, 280, 480) then mark() end
-            imgui.Text(u8"Высота окна")
-            if imgui.SliderInt("##sh", statH, 260, 380) then mark() end
-            imgui.EndChild()
-            imgui.PopStyleColor()
-        end
-
         statToggleCard("vis_time", "ВРЕМЯ РАБОТЫ", "Отображать продолжительность текущей работы.", visTime)
         statToggleCard("vis_money", "ДЕНЬГИ С СИСТЕМЫ", "Отображать заработок, полученный от системы.", visMoney)
         statToggleCard("vis_frame", "КОЛИЧЕСТВО FRAME", "Отображать количество полученных кейсов Frame.", visFrame)
         statToggleCard("vis_chests", "ДРУГИЕ ЛАРЦЫ И КЕЙСЫ", "Считать полученные ларцы и кейсы, кроме Frame.", visChests)
         statToggleCard("vis_total", "ОБЩИЙ ЗАРАБОТОК", "Отображать сумму системного заработка и стоимости Frame.", visTotal)
+        imgui.Spacing()
+
+        if showStats[0] then
+            imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
+            imgui.BeginChild("##stat_dimensions", V2(-1, 86 * RH_MENU_SHARED.S), true)
+            imgui.Text(RH_MENU_SHARED.u8("Ширина окна"))
+            if imgui.SliderInt("##sw", statW, 280, 480) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Высота окна"))
+            if imgui.SliderInt("##sh", statH, 260, 380) then mark() end
+            imgui.EndChild()
+            imgui.PopStyleColor()
+        end
 
         imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
-        imgui.BeginChild("##stat_price_card", V2(-1, 78 * S), true)
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ЦЕНА ОДНОГО FRAME ($)")
+        imgui.BeginChild("##stat_price_card", V2(-1, 78 * RH_MENU_SHARED.S), true)
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ЦЕНА ОДНОГО FRAME ($)"))
         imgui.PushItemWidth(-1)
         if imgui.InputInt("##cp", casePrice, 100000, 1000000) then
             if casePrice[0] < 0 then casePrice[0] = 0 end
@@ -1802,47 +2034,79 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         imgui.Spacing()
         imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
-        imgui.BeginChild("##stat_summary_card", V2(-1, 154 * S), true)
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"СВОДКА")
-        imgui.Text(u8"Время работы:  " .. fmtTime(workSec()))
-        imgui.Text(u8"Деньги с системы:  " .. fmtMoney(st.money))
-        imgui.Text(u8"Количество Frame:  " .. tostring(st.frame))
-        if visChests[0] then imgui.Text(u8"Другие ларцы и кейсы:  " .. tostring(st.chests)) end
+        imgui.BeginChild("##stat_summary_card", V2(-1, 154 * RH_MENU_SHARED.S), true)
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("СВОДКА"))
+        imgui.Text(RH_MENU_SHARED.u8("Время работы:  ") .. RH_MENU_SHARED.fmtTime(RH_MENU_SHARED.workSec()))
+        imgui.Text(RH_MENU_SHARED.u8("Деньги с системы:  ") .. RH_MENU_SHARED.fmtMoney(st.money))
+        imgui.Text(RH_MENU_SHARED.u8("Количество Frame:  ") .. tostring(st.frame))
+        if visChests[0] then imgui.Text(RH_MENU_SHARED.u8("Другие ларцы и кейсы:  ") .. tostring(st.chests)) end
         imgui.Separator()
-        imgui.TextColored(V4(0.18, 0.92, 0.62, 1), u8"ОБЩИЙ ЗАРАБОТОК:  " .. fmtMoney(totalMoney()))
+        imgui.TextColored(V4(0.18, 0.92, 0.62, 1), RH_MENU_SHARED.u8("ОБЩИЙ ЗАРАБОТОК:  ") .. RH_MENU_SHARED.fmtMoney(RH_MENU_SHARED.totalMoney()))
         imgui.EndChild()
         imgui.PopStyleColor()
         imgui.Spacing()
-        if imgui.Button(u8"ОЧИСТИТЬ ВСЁ", V2(-1, 40 * S)) then
+        if imgui.Button(RH_MENU_SHARED.u8("ОЧИСТИТЬ ВСЁ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
             st.clicks, st.money, st.frame, st.chests = 0, 0, 0, 0
             elapsedWork = 0
             t0 = working and os.time() or 0
             lastMoney = -1
             pendingLoot = nil
             saveCfg()
-            log("clear all")
         end
 
     elseif ui.tab == 5 then
-        imgui.TextDisabled(u8"ИНФОРМАЦИЯ О ПРОЕКТЕ")
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ИНФОРМАЦИЯ О ПРОЕКТЕ"))
         imgui.Spacing()
-        imgui.Text(u8"Версия: " .. VER)
-        imgui.Text(u8"Автор: Bows")
-        imgui.Text(u8"Платформа: Android / NeomLoader")
+        imgui.Text(RH_MENU_SHARED.u8("Версия: ") .. RH_MENU_SHARED.VER)
+        imgui.Text(RH_MENU_SHARED.u8("Автор: Bows"))
+        imgui.Text(RH_MENU_SHARED.u8("Платформа: Android / NeomLoader"))
         imgui.Spacing()
         imgui.Separator()
         imgui.Spacing()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ИСТОРИЯ ОБНОВЛЕНИЙ")
-        imgui.TextColored(V4(0.25, 0.88, 0.72, 1), u8"Версия 1.3  ·  20.11.2026")
-        imgui.BulletText(u8"Добавлено происшествие возле деревни Блуббери.")
-        imgui.BulletText(u8"Новые координаты добавлены в базу поиска ближайшего происшествия и авто-принятия заказа.")
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ИНФОРМАЦИЯ ОБ ОБНОВЛЕНИИ"))
+        imgui.TextColored(V4(0.25, 0.88, 0.72, 1), RH_MENU_SHARED.u8("Версия 1.4  ·  21.11.2026"))
+        imgui.Spacing()
+        imgui.TextWrapped(RH_MENU_SHARED.u8("Это обновление стало одним из самых масштабных для Road Helper. Интерфейс переработан, добавлены новые возможности и улучшена автоматизация."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("НОВЫЙ ИНТЕРФЕЙС И ОФОРМЛЕНИЕ"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Полностью обновлён интерфейс хелпера."))
+        imgui.BulletText(RH_MENU_SHARED.u8("Добавлены новые цветовые раскраски меню."))
+        imgui.BulletText(RH_MENU_SHARED.u8("Улучшено расположение элементов и взаимодействие с настройками."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ОСТАНОВКА ВРЕМЕНИ"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Добавлена остановка таймера рабочего времени при остановке рабочего режима. Время учитывается только во время активной работы."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("НОВЫЕ ФУНКЦИИ АВТОМАТИЗАЦИИ"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Автовзятие заказа — автоматически выбирает подходящее ближайшее происшествие из списка."))
+        imgui.BulletText(RH_MENU_SHARED.u8("Автоинструмент — помогает автоматически выбирать необходимые инструменты с учётом этапа ремонта."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("УДАР ПРИ ПОЯВЛЕНИИ СООБЩЕНИЯ О МУСОРЕ"))
+        imgui.BulletText(RH_MENU_SHARED.u8("При появлении в игровом чате сообщения о необходимости убрать мусор персонаж автоматически наносит короткий удар кулаком. Это служит визуальным сигналом о переходе к этапу уборки."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("КНОПКА «ПОДРОБНЕЕ»"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Добавлена возможность открыть подробное описание функций, их назначения и принципа работы."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("БЕТА-ТЕСТИРОВАНИЕ ФУНКЦИЙ"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Автозаказ и автоинструмент находятся в режиме бета-тестирования. Возможны ошибки и недоработки. Если заметили проблему, сообщите о ней автору."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ОБНОВЛЕНИЕ ПО ВОЗДУХУ (OTA)"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Хелпер поддерживает проверку и установку новых версий непосредственно через встроенный механизм обновления, без ручного поиска файла."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ЧТО БУДЕТ ДАЛЬШЕ?"))
+        imgui.BulletText(RH_MENU_SHARED.u8("Разработка основного функционала Road Helper завершена. Новые крупные функции больше не планируются."))
+        imgui.BulletText(RH_MENU_SHARED.u8("Дальнейшие обновления будут выходить для исправления багов и недоработок, а также повышения стабильности."))
+        imgui.Spacing()
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("СПАСИБО, ЧТО ПОЛЬЗУЕТЕСЬ ROAD HELPER!"))
+        imgui.TextWrapped(RH_MENU_SHARED.u8("Я хочу лично поблагодарить каждого, кто пользовался моим хелпером, ставил 5 звёзд, оставлял отзывы и сообщал об ошибках. Благодаря вашей поддержке и обратной связи Road Helper стал лучше. Огромное спасибо каждому из вас!"))
+        imgui.TextWrapped(RH_MENU_SHARED.u8("Следить за обновлениями и новыми скриптами можно в моём Telegram-канале: Автор-Телеграмм."))
+        imgui.TextColored(V4(0.25, 0.88, 0.72, 1), RH_MENU_SHARED.u8("С уважением, BOWS."))
         imgui.Spacing()
         imgui.Separator()
         imgui.Spacing()
         imgui.PushStyleColor(imgui.Col.Button, V4(0.035, 0.30, 0.48, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.04, 0.42, 0.66, 1.0))
         imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.025, 0.24, 0.39, 1.0))
-        if imgui.Button(u8"TELEGRAM  ·  @bowsscripts", V2(-1, 42 * S)) then
+        if imgui.Button(RH_MENU_SHARED.u8("TELEGRAM  ·  @bowsscripts"), V2(-1, 42 * RH_MENU_SHARED.S)) then
             local opened = false
             if type(openUrl) == "function" then
                 opened = pcall(openUrl, "https://t.me/bowsscripts")
@@ -1855,25 +2119,25 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Spacing()
         imgui.Separator()
         imgui.Spacing()
-        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), u8"ОБНОВЛЕНИЕ ПО ВОЗДУХУ")
-        imgui.TextDisabled(u8"Проверка новой версии и установка прямо в игре.")
+        imgui.TextColored(V4(0.20, 0.68, 1.00, 1), RH_MENU_SHARED.u8("ОБНОВЛЕНИЕ ПО ВОЗДУХУ"))
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Проверка новой версии и установка прямо в игре."))
         imgui.Spacing()
-        if imgui.Button(u8"ПРОВЕРИТЬ ОБНОВЛЕНИЯ", V2(-1, 42 * S)) then
+        if imgui.Button(RH_MENU_SHARED.u8("ПРОВЕРИТЬ ОБНОВЛЕНИЯ"), V2(-1, 42 * RH_MENU_SHARED.S)) then
             startUpdateCheck(true)
         end
         imgui.Spacing()
         imgui.TextWrapped(updateState.status)
         if updateState.checking then
-            imgui.TextDisabled(u8"Пожалуйста, подождите...")
+            imgui.TextDisabled(RH_MENU_SHARED.u8("Пожалуйста, подождите..."))
         elseif updateState.available then
-            imgui.TextColored(V4(0.25, 0.88, 0.72, 1), u8"Доступна версия " .. updateState.latest)
-            if imgui.Button(u8"УСТАНОВИТЬ ОБНОВЛЕНИЕ", V2(-1, 42 * S)) then
+            imgui.TextColored(V4(0.25, 0.88, 0.72, 1), RH_MENU_SHARED.u8("Доступна версия ") .. updateState.latest)
+            if imgui.Button(RH_MENU_SHARED.u8("УСТАНОВИТЬ ОБНОВЛЕНИЕ"), V2(-1, 42 * RH_MENU_SHARED.S)) then
                 installRoadHelperUpdate()
             end
         elseif updateState.error ~= "" then
-            imgui.TextWrapped(u8"Ошибка: " .. updateState.error)
+            imgui.TextWrapped(RH_MENU_SHARED.u8("Ошибка: ") .. updateState.error)
         end
-        imgui.TextDisabled(u8"Текущая версия: " .. VER)
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Текущая версия: ") .. RH_MENU_SHARED.VER)
     end
 
     imgui.EndChild()
@@ -1882,6 +2146,72 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.PopStyleVar(8)
 end)
 
+-- Отдельное окно подробной информации о выбранной функции.
+imgui.OnFrame(function() return functionPopupOpen[0] and ui.functionPopupData ~= nil end, function(self)
+    self.HideCursor = false
+    local item = ui.functionPopupData
+    if not item then functionPopupOpen[0] = false return end
+
+    local W = math.min(sizeX * 0.90, 520 * S)
+    local H = math.min(sizeY * 0.78, 430 * S)
+    imgui.SetNextWindowPos(V2(sizeX * 0.5, sizeY * 0.5), imgui.Cond.Always, V2(0.5, 0.5))
+    imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 13 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1 * S)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(16 * S, 14 * S))
+    local palette = RH_UI_THEMES[ui.theme] or RH_UI_THEMES[1]
+    imgui.PushStyleColor(imgui.Col.WindowBg, RH_themeColor(palette.window))
+    imgui.PushStyleColor(imgui.Col.Border, RH_themeColor(palette.border))
+    imgui.PushStyleColor(imgui.Col.Text, RH_themeColor(palette.text))
+    imgui.PushStyleColor(imgui.Col.TextDisabled, RH_themeColor(palette.disabled))
+
+    imgui.Begin(RH_MENU_SHARED.u8("ИНФОРМАЦИЯ О ФУНКЦИИ##rh_function_info"), functionPopupOpen,
+        imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoResize)
+    imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8(item.title))
+    imgui.Separator()
+    imgui.Spacing()
+    imgui.TextWrapped(RH_MENU_SHARED.u8(item.desc))
+    imgui.Spacing()
+    if item.id == "auto_tool" then
+        imgui.TextWrapped(RH_MENU_SHARED.u8("После включения вручную возьми первый нужный инструмент один раз. Скрипт распознает его, а затем будет выбирать инструменты по этапам ремонта. Для стабильной работы открывай меню багажника после смены этапа. Если текущий этап уже распознан, но инструмент не выбрался, нажми «АВТОВЗЯТИЕ» — хелпер повторит запрос выбора текущего инструмента. Заграждение, мусор и действия без известного ID выполняются вручную."))
+        imgui.Spacing()
+        if imgui.Button(RH_MENU_SHARED.u8("АВТОВЗЯТИЕ"), V2(-1, 40 * S)) then
+            if featureOn(autoTool) then
+                toolStartQueue()
+            else
+                sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Сначала включи функцию «Инструмент».", -1)
+            end
+        end
+    elseif item.id == "auto_flip" then
+        imgui.TextWrapped(RH_MENU_SHARED.u8("Настрой задержку перед отправкой команды, чтобы автомобиль успел остановиться после переворота."))
+    elseif item.id == "auto_click" then
+        imgui.TextWrapped(RH_MENU_SHARED.u8("Автоклик работает только во время соответствующей мини-игры. При завершении мини-игры нажатия прекращаются."))
+    end
+    imgui.Spacing()
+    imgui.Separator()
+    imgui.Spacing()
+    imgui.TextColored(item.flag[0] and V4(0.20, 0.95, 0.60, 1) or RH_themeColor(palette.disabled),
+        item.flag[0] and RH_MENU_SHARED.u8("СОСТОЯНИЕ: ВКЛЮЧЕНО") or RH_MENU_SHARED.u8("СОСТОЯНИЕ: ВЫКЛЮЧЕНО"))
+    imgui.Text(RH_MENU_SHARED.u8("ВКЛ / ВЫКЛ"))
+    if settingToggle("", item.flag, item.id, item.warning) then
+        if item.onChanged then item.onChanged() end
+        mark()
+        saveCfg()
+    end
+    if item.id == "auto_flip" then
+        imgui.Spacing()
+        imgui.Text(RH_MENU_SHARED.u8("Задержка перед /domkrat (сек.)"))
+        if imgui.SliderFloat("##rh_popup_flip_delay", flipDelay, 0.1, 3.0, "%.2f") then mark() end
+    end
+    imgui.Spacing()
+    imgui.Separator()
+    if imgui.Button(RH_MENU_SHARED.u8("ЗАКРЫТЬ"), V2(-1, 40 * S)) then
+        functionPopupOpen[0] = false
+    end
+    imgui.End()
+    imgui.PopStyleColor(4)
+    imgui.PopStyleVar(3)
+end)
 
 imgui.OnFrame(function() return showCtrl[0] end, function(self)
     self.HideCursor = false
@@ -1949,6 +2279,84 @@ imgui.OnFrame(function() return showCtrl[0] end, function(self)
         hold = 0
     end
     if hit and not drag and hold < HOLD then setWork(not working) end
+    imgui.End()
+    imgui.PopStyleColor(5)
+    imgui.PopStyleVar(5)
+end)
+
+imgui.OnFrame(function() return showToolButton[0] end, function(self)
+    self.HideCursor = false
+    local W, H = toolW[0], toolH[0]
+    local GROUP_W = W + H + 4 * S
+    local io = imgui.GetIO()
+    if toolDrag then
+        if imgui.IsMouseDown(0) then
+            toolX[0] = math.floor(io.MousePos.x - toolOx)
+            toolY[0] = math.floor(io.MousePos.y - toolOy)
+            toolX[0] = math.max(0, math.min(sizeX - GROUP_W, toolX[0]))
+            toolY[0] = math.max(0, math.min(sizeY - H, toolY[0]))
+        else
+            toolDrag = false; toolHold = 0; mark(); saveCfg()
+        end
+    end
+    imgui.SetNextWindowPos(V2(toolX[0], toolY[0]), imgui.Cond.Always)
+    imgui.SetNextWindowSize(V2(GROUP_W, H), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, H * 0.22)
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, H * 0.20)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(0, 0))
+    imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(0, 0))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0, 0, 0, 0))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.075, 0.095, 0.98))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.05, 0.25, 0.29, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.06, 0.35, 0.40, 1.0))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.88, 0.98, 0.95, 1.00))
+    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoBackground
+    imgui.Begin("##rh_tool_toggle_group", nil, flags)
+
+    local hit = imgui.Button("##rh_tool_button", V2(W, H))
+    local p1, p2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    local dl = imgui.GetWindowDrawList()
+    local label = autoTool[0] and u8"ИНСТРУМЕНТ: ВКЛ" or u8"ИНСТРУМЕНТ: ВЫКЛ"
+    local textSize = imgui.CalcTextSize(label)
+    local centerY = (p1.y + p2.y) * 0.5
+    local color = autoTool[0] and 0xFF55E6A8 or 0xFFB9C5D0
+    pcall(function()
+        dl:AddRect(p1, p2, autoTool[0] and 0xFF43D69A or 0xFF657487, H * 0.22, 0, 1.7 * S)
+        dl:AddText(V2(p1.x + (W - textSize.x) * 0.5, centerY - imgui.GetFontSize() * 0.5), color, label)
+    end)
+    if imgui.IsItemActive() and not toolDrag then
+        toolHold = toolHold + io.DeltaTime
+        if toolHold >= HOLD then
+            toolDrag = true
+            toolOx = io.MousePos.x - toolX[0]
+            toolOy = io.MousePos.y - toolY[0]
+        end
+    elseif not imgui.IsItemActive() and not toolDrag then
+        toolHold = 0
+    end
+    if hit and not toolDrag and toolHold < HOLD then toolSetEnabled(not autoTool[0]) end
+
+    imgui.SameLine(0, 4 * S)
+    local skipHit = imgui.Button("##rh_tool_skip", V2(H, H))
+    local q1, q2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    pcall(function()
+        dl:AddRect(q1, q2, 0xFF4A91C8, H * 0.20, 0, 1.7 * S)
+        local cx, cy = (q1.x + q2.x) * 0.5, (q1.y + q2.y) * 0.5
+        local arm = H * 0.18
+        dl:AddLine(V2(cx - arm * 0.45, cy - arm), V2(cx + arm * 0.45, cy), 0xFFEAF5FF, 3 * S)
+        dl:AddLine(V2(cx + arm * 0.45, cy), V2(cx - arm * 0.45, cy + arm), 0xFFEAF5FF, 3 * S)
+    end)
+    if skipHit then
+        if featureOn(autoTool) and toolStage and not toolNeedsManualTake then
+            toolLastHitAt = 0
+            toolAdvanceAfterHit()
+            sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап пропущен. Текущий этап: " .. (TOOL_ITEMS[toolStage] and TOOL_ITEMS[toolStage].name or "—"), -1)
+        else
+            sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Нельзя пропустить этап: включите инструмент и дождитесь распознавания этапа либо возьмите первый инструмент вручную.", -1)
+        end
+    end
+
     imgui.End()
     imgui.PopStyleColor(5)
     imgui.PopStyleVar(5)
@@ -2024,7 +2432,6 @@ imgui.OnFrame(function() return showRep[0] end, function(self)
     imgui.PopStyleVar(5)
 end)
 
-
 -- Окно подтверждения OTA-обновления и компактное уведомление.
 imgui.OnFrame(function() return updateState.prompt end, function(self)
     self.HideCursor = false
@@ -2099,12 +2506,9 @@ end, function(self)
 end)
 
 local function drawMiniStatRow(label, value, valueColor)
-    local valueText = u8(value)
-    local available = imgui.GetContentRegionAvail()
-    local valueSize = imgui.CalcTextSize(valueText)
-    imgui.TextDisabled(u8(label))
-    imgui.SameLine()
-    imgui.SetCursorPosX(math.max(92 * S, available.x - valueSize.x))
+    local labelText, valueText = u8(label), u8(value)
+    imgui.TextDisabled(labelText)
+    imgui.SameLine(0, 7 * S)
     imgui.TextColored(valueColor or V4(0.82, 0.92, 0.97, 1.00), valueText)
 end
 
@@ -2141,7 +2545,7 @@ imgui.OnFrame(function() return showStats[0] end, function(self)
         drawMiniStatRow("Заработок", fmtMoney(st.money), V4(0.48, 0.84, 0.91, 1.00))
     end
     if visFrame[0] then
-        drawMiniStatRow("Frame", tostring(st.frame) .. " шт. (" .. fmtMoney(st.frame * casePrice[0]) .. ")", V4(0.47, 0.78, 0.94, 1.00))
+        drawMiniStatRow("Frame", tostring(st.frame) .. " шт. · " .. fmtMoney(st.frame * casePrice[0]), V4(0.47, 0.78, 0.94, 1.00))
     end
     if visChests[0] then
         drawMiniStatRow("Ларцы", tostring(st.chests) .. " шт.", V4(0.68, 0.84, 0.91, 1.00))
@@ -2401,10 +2805,9 @@ end
 function main()
     while not isSampAvailable() do wait(100) end
     loadCfg()
-    loadRoadIcons()
-    log("load 2.7.5")
+    if autoTool[0] then toolNeedsManualTake = true; toolStage = nil end
     sampRegisterChatCommand("rh", toggleMenu)
-    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v1.3", -1)
+    sampAddChatMessage("{00BFFF}[Road Helper] Загружен. /rh | v" .. VER, -1)
 
     lua_thread.create(function()
         wait(9000)
@@ -2418,6 +2821,24 @@ function main()
         wait(0)
         processPendingOrder()
 
+        if toolRollerWaitAt > 0 and (os.clock() - toolRollerWaitAt) >= TOOL_ROLLER_MENU_TIMEOUT then
+            toolRollerWaitAt = 0
+            toolStage = nil
+            toolNeedsManualTake = false
+            toolButtonGeneration = toolButtonGeneration + 1
+            toolQueueBusy = false
+            sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Меню не открывалось 5 минут после взятия катка. Этап сброшен — ожидаю сообщение сервера или первое ручное взятие.", -1)
+        end
+
+        if toolTrunkFlag then
+            toolTrunkFlag = false
+            if featureOn(autoTool) and not toolNeedsManualTake then
+                toolStartQueue()
+            elseif featureOn(autoTool) and toolNeedsManualTake then
+                sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Жду сообщение сервера об этапе или первое ручное взятие инструмента.", -1)
+            end
+        end
+
         local sampAvailable = isSampAvailable()
         if wasSampAvailable and not sampAvailable then
             -- При выходе с сервера сбрасываем только таймер; накопленная статистика остаётся.
@@ -2428,6 +2849,13 @@ function main()
             RH_ORDER.dialogOpen = false
             RH_ORDER.processing = false
             clicker = false
+            toolRollerWaitAt = 0
+            if autoTool[0] then
+                toolStage = nil
+                toolNeedsManualTake = true
+                toolButtonGeneration = toolButtonGeneration + 1
+                toolQueueBusy = false
+            end
             pendingLoot = nil
             autoFillGeneration = autoFillGeneration + 1
             gasState = { gasType = nil, maxGas = nil, currentGas = nil }
@@ -2453,7 +2881,6 @@ function main()
                         if d > 0 and d < 50000000 then
                             st.money = st.money + d
                             mark()
-                            log("money +" .. d)
                         end
                         lastMoney = money
                     else
@@ -2469,7 +2896,6 @@ function main()
                 if not flipped and (os.clock() - flipT) >= flipDelay[0] then
                     flipped = true
                     sampSendChat("/domkrat")
-                    log("flip")
                 end
             else
                 flipT, flipped = nil, false
