@@ -1,8 +1,8 @@
 script_name("Taxi Helper")
 script_author("Bows")
-script_version("1.0")
+script_version("Тест")
 
-local VER = "1.0"
+local VER = "Тест"
 
 local bit = require "bit"
 local imgui = require "mimgui"
@@ -61,15 +61,26 @@ RH_UI_THEMES = {
 }
 function RH_themeColor(c) return imgui.ImVec4(c[1], c[2], c[3], c[4]) end
 
+local autoClick   = new.bool(false)
+local autoTool    = new.bool(false)
+local autoCaptcha = new.bool(false)
+local autoRepairs = new.bool(false)
 local autoFlip    = new.bool(true)
 local autoLock    = new.bool(false)
 local autoFill    = new.bool(false)
 local taxiCatch    = new.bool(true)
 local maxOrderDistance = new.int(3000) -- metres; 0 disables the limit
 
+RH_ORDER = RH_ORDER or {}
+RH_ORDER.enabled = new.bool(false)
+RH_ORDER.pending = nil
+RH_ORDER.pendingAt = 0
+RH_ORDER.dialogOpen = false
+RH_ORDER.processing = false
 local flipDelay   = new.float(0.75)
 
 local showCtrl  = new.bool(true)
+local showRep   = new.bool(false)
 local showStats = new.bool(true)
 
 local ctrlX = new.int(20)
@@ -77,94 +88,105 @@ local ctrlY = new.int(math.floor(sizeY / 2 - 30))
 local ctrlW = new.int(180)
 local ctrlH = new.int(48)
 
--- Отдельная плавающая кнопка мини-карты, расположенная под СТАРТ/СТОП.
-local mapBtnX = new.int(20)
-local mapBtnY = new.int(math.floor(sizeY / 2 + 26))
-local mapBtnW = new.int(180)
-local mapBtnH = new.int(48)
-local showMapButton = new.bool(true)
-local taxiMapZoom = new.float(1.0)
+-- Кнопка открытия большой карты имеет собственные координаты и размер.
+local showBigMapButton = new.bool(true)
+local bigMapBtnX = new.int(20)
+local bigMapBtnY = new.int(math.floor(sizeY / 2 - 70))
+local bigMapBtnW = new.int(150)
+local bigMapBtnH = new.int(42)
+local bigMapBtnHold, bigMapBtnDrag = 0, false
+local bigMapBtnOx, bigMapBtnOy = 0, 0
+local bigMapBtnSuppressClick = false
+local taxiBigMapZoom = new.float(1.0)
+-- Режим карты используется только большой картой.
+local taxiMapMode = "auto"
 local taxiMarkerX, taxiMarkerY = nil, nil
-local mapBtnHold, mapBtnDrag = 0, false
-local mapBtnOx, mapBtnOy = 0, 0
-local mapBtnSuppressClick = false
+
+local repX = new.int(20)
+local repY = new.int(math.floor(sizeY / 2 + 40))
+local repW = new.int(180)
+local repH = new.int(48)
+
+-- Отдельная плавающая кнопка управления автоматическим подбором инструментов.
+local showToolButton = new.bool(false)
+local toolX = new.int(20)
+local toolY = new.int(math.floor(sizeY / 2 + 100))
+local toolW = new.int(180)
+local toolH = new.int(48)
+local toolHold, toolDrag = 0, false
+local toolOx, toolOy = 0, 0
+local toolButtonGeneration = 0
+local toolStage = nil
+local toolNeedsManualTake = true
+local toolTrunkFlag = false
+local toolLastOpen = 0
+local toolQueueBusy = false
+local toolRepeatDelayMs = 50
+local toolIgnoreOutUntil = 0
+local toolLastHitAt = 0
+local toolRollerWaitAt = 0
+local TOOL_ROLLER_MENU_TIMEOUT = 5 * 60
+local toolStartQueue -- forward declaration: chat/hit stage changes can start the queue immediately
 
 local statW = new.int(300)
 local statH = new.int(250)
 
 local visTime   = new.bool(true)
 local visMoney  = new.bool(true)
+local visFrame  = new.bool(true)
+local visChests = new.bool(true)
+local visTotal  = new.bool(true)
+
+local casePrice = new.int(5000000)
 
 local working = false
+local clicker = false
 local autoFillGeneration = 0
 local gasState = { gasType = nil, maxGas = nil, currentGas = nil }
 
 local function featureOn(flag)
     return working and flag ~= nil and flag[0] == true
 end
+
+-- Чтение баланса по проверенной старой схеме Taxi Helper:
+-- именно getPlayerMoney(PLAYER_PED), без альтернативных API, которые
+-- в некоторых сборках возвращают чужое/некорректное значение.
+local function readCurrentPlayerMoney()
+    if type(getPlayerMoney) ~= 'function' then return nil end
+    local ok, value = pcall(getPlayerMoney, PLAYER_PED)
+    if not ok then return nil end
+    value = tonumber(value)
+    if value == nil or value < 0 then return nil end
+    return value
+end
+local trunk = false
 local t0 = 0
 local elapsedWork = 0
 local lastMoney = -1
 local moneyResetGuardUntil = 0
-local moneyBaselinePending = false
-local moneySessionGen = 0
-local moneyBaselineHits = 0
-local moneyBaselineCandidate = nil
-local MONEY_BASELINE_NEED = 3
+-- После ручного сброса первая доступная выборка баланса становится новой базой.
+-- Это не позволяет старому балансу повторно попасть в заработок сессии.
+local moneyResetPending = false
 
 local hold, drag = 0, false
 local dox, doy = 0, 0
+local rhold, rdrag = 0, false
+local rox, roy = 0, 0
 local HOLD = 0.35
 local TAP = 45
 
 local flipT, flipped = nil, false
+local repairsAt = 0
 
-local st = { money = 0 }
-
--- Получение текущего баланса с поддержкой разных API MoonLoader/NeomLoader.
--- В разных сборках getPlayerMoney принимает либо 0 аргументов, либо PLAYER_PED.
-local function readTaxiPlayerMoney()
-    local function validMoney(value)
-        local n = tonumber(value)
-        if n and n >= 0 and n < 1000000000000 then return n end
-        return nil
-    end
-
-    if type(getPlayerMoney) == "function" then
-        local ok, value = pcall(getPlayerMoney)
-        local n = ok and validMoney(value) or nil
-        if n ~= nil then return n end
-        ok, value = pcall(getPlayerMoney, PLAYER_PED)
-        n = ok and validMoney(value) or nil
-        if n ~= nil then return n end
-    end
-
-    if type(sampGetPlayerIdByCharHandle) == "function" and type(sampGetPlayerMoney) == "function" then
-        local ok, a, b = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
-        if ok then
-            local playerId = (a == true) and b or a
-            playerId = tonumber(playerId)
-            if playerId and playerId >= 0 then
-                local moneyOk, value = pcall(sampGetPlayerMoney, playerId)
-                local n = moneyOk and validMoney(value) or nil
-                if n ~= nil then return n end
-            end
-        end
-    end
-
-    if type(getCharMoney) == "function" then
-        local ok, value = pcall(getCharMoney, PLAYER_PED)
-        local n = ok and validMoney(value) or nil
-        if n ~= nil then return n end
-    end
-    return nil
-end
+local st = { clicks = 0, money = 0, frame = 0, chests = 0 }
+local pendingLoot = nil
 
 local dirty = false
 local savedAt = 0
 
 local function V2(x, y) return imgui.ImVec2(x, y) end
 local function V4(r, g, b, a) return imgui.ImVec4(r, g, b, a) end
+local COL = 0xFFFFFFFF
 
 local function fmtTime(sec)
     local h = math.floor(sec / 3600)
@@ -191,11 +213,18 @@ local function workSec()
 end
 
 local function totalMoney()
-    return st.money
+    return st.money + (st.frame * casePrice[0])
 end
 
 local function mark()
     dirty = true
+end
+
+local function openRepairs()
+    local now = os.clock()
+    if now < repairsAt then return end
+    repairsAt = now + 5.0
+    sampSendChat("/repairs")
 end
 
 local function qmul(a, b, c, d, w, x, y, z)
@@ -237,27 +266,49 @@ local function saveCfg()
         f:write("ctrlY=" .. ctrlY[0] .. "\n")
         f:write("ctrlW=" .. ctrlW[0] .. "\n")
         f:write("ctrlH=" .. ctrlH[0] .. "\n")
-        f:write("mapBtnX=" .. mapBtnX[0] .. "\n")
-        f:write("mapBtnY=" .. mapBtnY[0] .. "\n")
-        f:write("mapBtnW=" .. mapBtnW[0] .. "\n")
-        f:write("mapBtnH=" .. mapBtnH[0] .. "\n")
-        f:write("showMapButton=" .. (showMapButton[0] and "1" or "0") .. "\n")
-        f:write("taxiMapZoom=" .. tostring(taxiMapZoom[0]) .. "\n")
+        f:write("showBigMapButton=" .. (showBigMapButton[0] and "1" or "0") .. "\n")
+        f:write("bigMapBtnX=" .. bigMapBtnX[0] .. "\n")
+        f:write("bigMapBtnY=" .. bigMapBtnY[0] .. "\n")
+        f:write("bigMapBtnW=" .. bigMapBtnW[0] .. "\n")
+        f:write("bigMapBtnH=" .. bigMapBtnH[0] .. "\n")
+        f:write("taxiBigMapZoom=" .. tostring(taxiBigMapZoom[0]) .. "\n")
+        f:write("taxiMapMode=" .. tostring(taxiMapMode) .. "\n")
+        f:write("repX=" .. repX[0] .. "\n")
+        f:write("repY=" .. repY[0] .. "\n")
+        f:write("repW=" .. repW[0] .. "\n")
+        f:write("repH=" .. repH[0] .. "\n")
+        f:write("toolX=" .. toolX[0] .. "\n")
+        f:write("toolY=" .. toolY[0] .. "\n")
+        f:write("toolW=" .. toolW[0] .. "\n")
+        f:write("toolH=" .. toolH[0] .. "\n")
+        f:write("showToolButton=" .. b(showToolButton[0]) .. "\n")
         f:write("statW=" .. statW[0] .. "\n")
         f:write("statH=" .. statH[0] .. "\n")
         f:write("uiTheme=" .. ui.theme .. "\n")
         f:write("showCtrl=" .. b(showCtrl[0]) .. "\n")
+        f:write("showRep=" .. b(showRep[0]) .. "\n")
         f:write("showStats=" .. b(showStats[0]) .. "\n")
         f:write("visTime=" .. b(visTime[0]) .. "\n")
         f:write("visMoney=" .. b(visMoney[0]) .. "\n")
+        f:write("visFrame=" .. b(visFrame[0]) .. "\n")
+        f:write("visChests=" .. b(visChests[0]) .. "\n")
+        f:write("visTotal=" .. b(visTotal[0]) .. "\n")
+        f:write("autoClick=" .. b(autoClick[0]) .. "\n")
+        f:write("autoTool=" .. b(autoTool[0]) .. "\n")
+        f:write("autoCaptcha=" .. b(autoCaptcha[0]) .. "\n")
+        f:write("autoRepairs=" .. b(autoRepairs[0]) .. "\n")
         f:write("autoFlip=" .. b(autoFlip[0]) .. "\n")
         f:write("autoLock=" .. b(autoLock[0]) .. "\n")
         f:write("autoFill=" .. b(autoFill[0]) .. "\n")
         f:write("autoTakeOrder=" .. b(taxiCatch[0]) .. "\n")
         f:write("maxOrderDistance=" .. tostring(maxOrderDistance[0]) .. "\n")
         f:write("flipDelay=" .. tostring(flipDelay[0]) .. "\n")
+        f:write("casePrice=" .. casePrice[0] .. "\n")
         f:write("money=" .. st.money .. "\n")
         f:write("taxiCatch=" .. b(taxiCatch[0]) .. "\n")
+        f:write("frame=" .. st.frame .. "\n")
+        f:write("chests=" .. st.chests .. "\n")
+        f:write("clicks=" .. st.clicks .. "\n")
         f:close()
         dirty = false
         savedAt = os.clock()
@@ -280,19 +331,37 @@ local function loadCfg()
                 elseif k == "ctrlY" and n then ctrlY[0] = n
                 elseif k == "ctrlW" and n then ctrlW[0] = n
                 elseif k == "ctrlH" and n then ctrlH[0] = n
-                elseif k == "mapBtnX" and n then mapBtnX[0] = n
-                elseif k == "mapBtnY" and n then mapBtnY[0] = n
-                elseif k == "mapBtnW" and n then mapBtnW[0] = n
-                elseif k == "mapBtnH" and n then mapBtnH[0] = n
-                elseif k == "showMapButton" then showMapButton[0] = on
-                elseif k == "taxiMapZoom" and n then taxiMapZoom[0] = math.max(0.50, math.min(2.00, n))
+                elseif k == "showBigMapButton" then showBigMapButton[0] = on
+                elseif k == "bigMapBtnX" and n then bigMapBtnX[0] = n
+                elseif k == "bigMapBtnY" and n then bigMapBtnY[0] = n
+                elseif k == "bigMapBtnW" and n then bigMapBtnW[0] = math.max(90, math.min(320, n))
+                elseif k == "bigMapBtnH" and n then bigMapBtnH[0] = math.max(32, math.min(100, n))
+                elseif k == "taxiBigMapZoom" and n then taxiBigMapZoom[0] = math.max(0.5, math.min(2.0, n))
+                elseif k == "taxiMapMode" and (v == "auto" or v == "standard" or v == "vc") then taxiMapMode = v
+                elseif k == "repX" and n then repX[0] = n
+                elseif k == "repY" and n then repY[0] = n
+                elseif k == "repW" and n then repW[0] = n
+                elseif k == "repH" and n then repH[0] = n
+                elseif k == "toolX" and n then toolX[0] = n
+                elseif k == "toolY" and n then toolY[0] = n
+                elseif k == "toolW" and n then toolW[0] = n
+                elseif k == "toolH" and n then toolH[0] = n
+                elseif k == "showToolButton" then showToolButton[0] = on
                 elseif k == "statW" and n then statW[0] = n
                 elseif k == "statH" and n then statH[0] = n
                 elseif k == "uiTheme" and n then ui.theme = math.max(1, math.min(3, math.floor(n)))
                 elseif k == "showCtrl" then showCtrl[0] = on
+                elseif k == "showRep" then showRep[0] = on
                 elseif k == "showStats" then showStats[0] = on
                 elseif k == "visTime" then visTime[0] = on
                 elseif k == "visMoney" then visMoney[0] = on
+                elseif k == "visFrame" then visFrame[0] = on
+                elseif k == "visChests" then visChests[0] = on
+                elseif k == "visTotal" then visTotal[0] = on
+                elseif k == "autoClick" then autoClick[0] = on
+                elseif k == "autoTool" then autoTool[0] = on
+                elseif k == "autoCaptcha" then autoCaptcha[0] = on
+                elseif k == "autoRepairs" then autoRepairs[0] = on
                 elseif k == "autoFlip" then autoFlip[0] = on
                 elseif k == "autoLock" then autoLock[0] = on
                 elseif k == "autoFill" then autoFill[0] = on
@@ -300,18 +369,39 @@ local function loadCfg()
                 elseif k == "autoTakeOrder" then taxiCatch[0] = on
                 elseif k == "maxOrderDistance" and n then maxOrderDistance[0] = math.max(0, math.min(50000, math.floor(n)))
                 elseif k == "flipDelay" and n then flipDelay[0] = math.max(0.1, math.min(3, n))
+                elseif k == "casePrice" and n then casePrice[0] = n
                 elseif k == "money" and n then st.money = n
+                elseif k == "frame" and n then st.frame = n
+                elseif k == "chests" and n then st.chests = n
+                elseif k == "clicks" and n then st.clicks = n
                 elseif k == "stat_money" and n then st.money = n
+                elseif k == "stat_frame" and n then st.frame = n
+                elseif k == "stat_chests" and n then st.chests = n
+                elseif k == "stat_clicks" and n then st.clicks = n
+                elseif k == "case_price" and n then casePrice[0] = n
                 elseif k == "ctrl_pos_x" and n then ctrlX[0] = n
                 elseif k == "ctrl_pos_y" and n then ctrlY[0] = n
                 elseif k == "ctrl_width" and n then ctrlW[0] = n
                 elseif k == "ctrl_height" and n then ctrlH[0] = n
+                elseif k == "rep_pos_x" and n then repX[0] = n
+                elseif k == "rep_pos_y" and n then repY[0] = n
+                elseif k == "rep_width" and n then repW[0] = n
+                elseif k == "rep_height" and n then repH[0] = n
                 elseif k == "stats_width" and n then statW[0] = n
                 elseif k == "stats_height" and n then statH[0] = n
                 elseif k == "show_control" then showCtrl[0] = on
+                elseif k == "show_repairs" then showRep[0] = on
+                elseif k == "show_tool_button" then showToolButton[0] = on
                 elseif k == "show_stats" then showStats[0] = on
                 elseif k == "show_stat_time" then visTime[0] = on
                 elseif k == "show_stat_money" then visMoney[0] = on
+                elseif k == "show_stat_frame" then visFrame[0] = on
+                elseif k == "show_stat_chests" then visChests[0] = on
+                elseif k == "show_stat_total" then visTotal[0] = on
+                elseif k == "auto_clicker" then autoClick[0] = on
+                elseif k == "auto_tool" then autoTool[0] = on
+                elseif k == "auto_captcha" then autoCaptcha[0] = on
+                elseif k == "auto_open_repairs" then autoRepairs[0] = on
                 elseif k == "auto_flip" then autoFlip[0] = on
                 elseif k == "auto_lock" then autoLock[0] = on
                 elseif k == "auto_fill" then autoFill[0] = on
@@ -322,6 +412,8 @@ local function loadCfg()
         f:close()
         statW[0] = math.max(280, math.min(480, statW[0]))
         statH[0] = math.max(210, math.min(380, statH[0]))
+        bigMapBtnW[0] = math.max(90, math.min(320, bigMapBtnW[0]))
+        bigMapBtnH[0] = math.max(32, math.min(100, bigMapBtnH[0]))
     end)
 end
 
@@ -333,20 +425,34 @@ local function setWork(on)
     if on then
         if working then return end
         working = true
+        RH_ORDER.pending = nil
+        RH_ORDER.dialogOpen = false
+        RH_ORDER.processing = false
         t0 = os.time()
-        -- Новая рабочая сессия учёта: база баланса только после стабильных чтений.
-        moneySessionGen = moneySessionGen + 1
-        lastMoney = -1
-        moneyBaselinePending = true
-        moneyBaselineHits = 0
-        moneyBaselineCandidate = nil
-        moneyResetGuardUntil = os.clock() + 1.5
+        -- Снимок баланса при старте нужен только как контрольная точка;
+        -- заработок учитывается по серверным сообщениям об оплате.
+        local moneySnapshot = readCurrentPlayerMoney()
+        lastMoney = moneySnapshot or -1
+        moneyResetPending = false
+        moneyResetGuardUntil = os.clock() + 3.0
+        pendingLoot = nil
+        trunk = false
         sampAddChatMessage("{00FF00}[Taxi Helper] Запущен", -1)
     else
         if not working then return end
         if t0 > 0 then elapsedWork = elapsedWork + math.max(0, os.time() - t0) end
         t0 = 0
         working = false
+        -- Глобальный СТОП также немедленно отменяет уже запущенную очередь инструментов.
+        toolButtonGeneration = toolButtonGeneration + 1
+        toolQueueBusy = false
+        toolTrunkFlag = false
+        toolRollerWaitAt = 0
+        RH_ORDER.pending = nil
+        RH_ORDER.dialogOpen = false
+        RH_ORDER.processing = false
+        pendingLoot = nil
+        clicker = false
         autoFillGeneration = autoFillGeneration + 1
         gasState = { gasType = nil, maxGas = nil, currentGas = nil }
         saveCfg()
@@ -354,10 +460,53 @@ local function setWork(on)
     end
 end
 
+function sendCef(str)
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 18)
+    raknetBitStreamWriteInt16(bs, #str)
+    raknetBitStreamWriteString(bs, str)
+    raknetBitStreamWriteInt32(bs, 0)
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+end
+
+function sendClickIface(iid, id, sub, json)
+    json = json or ""
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 63)
+    raknetBitStreamWriteInt8(bs, iid)
+    raknetBitStreamWriteInt32(bs, id or 0)
+    raknetBitStreamWriteInt32(bs, sub or 0)
+    raknetBitStreamWriteInt32(bs, #json)
+    raknetBitStreamWriteString(bs, json)
+    if raknetSendBitStreamEx then
+        raknetSendBitStreamEx(bs, 1, 10, 1)
+    else
+        raknetSendBitStream(bs)
+    end
+    raknetDeleteBitStream(bs)
+end
+
+function sendLoaded(iid, on)
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 66)
+    raknetBitStreamWriteInt8(bs, iid)
+    raknetBitStreamWriteBool(bs, on and true or false)
+    if raknetSendBitStreamEx then
+        raknetSendBitStreamEx(bs, 1, 10, 1)
+    else
+        raknetSendBitStream(bs)
+    end
+    raknetDeleteBitStream(bs)
+end
+
 -- Arizona gas-station frontend protocol (integrated AutoFill).
 local GAS_INTERFACE_ID = 48
 
-function sendGasInterfaceState(interfaceId, state)
+local function sendGasInterfaceState(interfaceId, state)
     local bs = raknetNewBitStream()
     raknetBitStreamWriteInt8(bs, 220)
     raknetBitStreamWriteInt8(bs, 66)
@@ -455,6 +604,12 @@ local function handleGasFrontend(interfaceId, subId, payload)
     end
 end
 
+function tap()
+    sendClickIface(25, 0, 0, "")
+    sendCef("clickMinigame")
+    st.clicks = st.clicks + 1
+end
+
 function initTaxiEngine()
 -- ============================================================
 -- TAXI ENGINE (перенесён из Taxibows.lua; интерфейс Taxi Helper)
@@ -473,7 +628,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION = '1.0'
+local VERSION = 'Тест'
 
 -- ============================================================
 --  АВТООПРЕДЕЛЕНИЕ КОДИРОВКИ ФАЙЛА
@@ -526,19 +681,46 @@ end
 -- ============================================================
 --  КОНСТАНТЫ ЛОВЛИ
 -- ============================================================
+local CFG -- объявляется заранее для функций таймингов режима ловли
 local CATCH = {
-    ACCEPT_DELAY_MIN     = 20,
-    ACCEPT_DELAY_MAX     = 45,
+    ACCEPT_DELAY_MIN     = 35,
+    ACCEPT_DELAY_MAX     = 65,
     PENDING_TIMEOUT      = 15.0,
-    MOBILE_COLLECT_SEC   = 0.45,
-    MOBILE_COLLECT_MAX   = 0.90,
-    MOBILE_RETRY_SEC     = 0.25,
-    MOBILE_MAX_RETRIES   = 6,
+    MOBILE_COLLECT_SEC   = 0.25,
+    MOBILE_COLLECT_MAX   = 0.55,
+    MOBILE_REFRESH_SEC   = 0.35,
+    MOBILE_RETRY_SEC     = 0.12,
+    MOBILE_MAX_RETRIES   = 4,
     MOBILE_HOLD_SEC      = 0.35,
-    MOBILE_CONFIRM_SEC   = 8.0,
+    MOBILE_CONFIRM_SEC   = 3.0,
     MOBILE_COOLDOWN_SEC  = 1.2,
     MAX_VALID_DIST_M     = 100000,
 }
+
+-- Турбо не должен выбирать первого клиента до прихода остальных частей
+-- пачки. Используем короткое окно тишины после последнего пакета и жёсткий
+-- предел, чтобы одновременно сохранить скорость и корректный выбор ближайшего.
+local function mobileCollectInitialSec()
+    return CFG and CFG.turboCatch and 0.35 or 0.55
+end
+
+local function mobileCollectQuietSec()
+    return CFG and CFG.turboCatch and 0.18 or 0.20
+end
+
+local function mobileCollectMaxSec()
+    return CFG and CFG.turboCatch and 0.90 or 1.05
+end
+
+local function mobileRetryIntervalSec()
+    return CFG and CFG.turboCatch and 0.035 or 0.18
+end
+
+local function mobileConfirmTimeoutSec()
+    -- В TURBO быстрее освобождаем зависший ID, но оставляем серверу
+    -- достаточное время ответить на запрос принятия заказа.
+    return CFG and CFG.turboCatch and 1.50 or CATCH.MOBILE_CONFIRM_SEC
+end
 
 local function humanDelayMs(minMs, maxMs)
     local mid = math.floor((minMs + maxMs) / 2)
@@ -649,12 +831,12 @@ local function logRaw(tag, msg)
     end
 
     LOG_BUF[#LOG_BUF + 1] = u8(line) .. '\n'
-    if tagStr == 'ERROR' or #LOG_BUF >= 20 then
+    if tagStr == 'ERROR' or tagStr == 'ORDER_PACKET' or #LOG_BUF >= 20 then
         flushLogBuffer(true)
     end
 end
 
-local function logInit(reason)
+function logInit(reason)
     flushLogBuffer(true)
     local isInitial = (reason == nil)
     local mode = isInitial and 'w' or 'a'
@@ -670,7 +852,7 @@ local function logInit(reason)
 end
 
 local function logChat(t) logRaw('CHAT',  t) end
-local function logAct(t)  logRaw('ACT',   t) end
+function logAct(t)  logRaw('ACT',   t) end
 local function logDlg(t)  logRaw('DLG',   t) end
 local function logErr(t)  logRaw('ERROR', t) end
 
@@ -689,34 +871,39 @@ local STATS = {
 local notify -- forward declaration: reset action also displays a HUD message
 
 local function resetTaxiSessionStats()
-    -- Полный сброс накопителей сессии. Игровой баланс на сервере не трогаем.
-    moneySessionGen = moneySessionGen + 1
+    -- Сбрасываем только накопители текущей смены. Данные навыка таксиста
+    -- (уровень, опыт и тариф) остаются серверными и не изменяются.
     st.money = 0
+    st.clicks = 0
+    st.frame = 0
+    st.chests = 0
+    pendingLoot = nil
     STATS.sessionDone = 0
     elapsedWork = 0
     t0 = working and os.time() or 0
 
-    -- Новая сессия учёта: любые старые дельты баланса игнорируются.
+    -- Новая точка отсчёта баланса: первая выборка после сброса станет базой.
+    -- Защитное окно не позволяет старой дельте вернуть прежний заработок.
     lastMoney = -1
-    moneyBaselinePending = true
-    moneyBaselineHits = 0
-    moneyBaselineCandidate = nil
-    moneyResetGuardUntil = os.clock() + 3.0
+    moneyResetPending = true
+    moneyResetGuardUntil = os.clock() + 5.0
 
-    -- Сразу пишем money=0 в конфиг, чтобы значение не вернулось после перезагрузки.
     dirty = true
     saveCfg()
+    -- saveCfg записывает нулевые значения; фиксируем состояние после сохранения.
+    st.money = 0
+    st.clicks = 0
+    st.frame = 0
+    st.chests = 0
+    STATS.sessionDone = 0
+    elapsedWork = 0
     dirty = false
     savedAt = os.clock()
 
-    -- Повторно фиксируем ноль на случай гонки с циклом учёта.
-    st.money = 0
-
-    local msg = L'Заработок и статистика сброшены: $0'
-    notify(msg, 0x00CCB3)
-    pcall(sampAddChatMessage, "{00CCB3}[Taxi Helper] {FFFFFF}" .. msg .. " | gen=" .. tostring(moneySessionGen), -1)
-    logAct('SESSION STATS RESET hard: money=0 orders=0 time=0 gen=' .. tostring(moneySessionGen))
+    notify(L'Заработок и статистика сброшены: $0', 0x00CCB3)
+    logAct('SESSION STATS RESET: money=0 clicks=0 frame=0 chests=0 orders=0 time=0; skill data preserved')
 end
+
 local function expRemaining()
     if type(STATS.expCur) == 'number' and type(STATS.expNeed) == 'number' then
         return math.max(0, STATS.expNeed - STATS.expCur)
@@ -766,12 +953,31 @@ local function parseTaxiStatsFromDialog(cleanTitle, cleanBody)
         if not expCurStr then
             expCurStr, expNeedStr = fullN:match(L'опыт[^%d]*(%d+)%s*/%s*(%d+)')
         end
+        if not expCurStr then
+            expCurStr, expNeedStr = fullN:match(L'опыт[^%d]*(%d+)%s+из%s+(%d+)')
+        end
+        if not expCurStr then
+            expCurStr, expNeedStr = fullN:match(L'(%d+)%s*/%s*(%d+)[^%d]*опыт')
+        end
     end
     if expCurStr and expNeedStr then
         local cur, need = tonumber(expCurStr), tonumber(expNeedStr)
         if cur and need and need > 0 then
             STATS.expCur = cur
             STATS.expNeed = need
+            updated = true
+        end
+    end
+
+    -- Некоторые варианты окна/уведомления показывают только остаток опыта.
+    -- Если текущее значение уже известно, восстанавливаем требуемое значение.
+    if not (expCurStr and expNeedStr) and type(STATS.expCur) == 'number' then
+        local remainingStr = fullN:match(L'до следующего уровня[^%d]*(%d+)')
+            or fullN:match(L'осталось опыта[^%d]*(%d+)')
+            or fullN:match(L'необходимо опыта[^%d]*(%d+)')
+        local remaining = tonumber(remainingStr)
+        if remaining and remaining >= 0 then
+            STATS.expNeed = STATS.expCur + remaining
             updated = true
         end
     end
@@ -795,7 +1001,7 @@ end
 -- ============================================================
 --  КОНФИГ (ТОЛЬКО ЛОВЛЯ)
 -- ============================================================
-local CFG = {
+CFG = {
     catchEnabled = true,
     autoAccept   = true,
     turboCatch   = false,
@@ -832,7 +1038,7 @@ end
 --  УВЕДОМЛЕНИЯ (HUD-БАННЕР + АНТИ-СПАМ)
 -- ============================================================
 local RH_MENU_SHARED -- forward declaration: HUD уведомления используют таблицу, созданную ниже
-local NOTIFY_DURATION = 3.0
+local NOTIFY_DURATION = 2.0
 local NOTIFY_ANIM_IN  = 0.00 -- уведомление появляется целиком, без выезда сверху
 local NOTIFY_ANIM_OUT = 0.16
 
@@ -931,10 +1137,10 @@ imgui.OnFrame(function() return true end, function(self)
     -- Центр уведомления располагается немного ниже центра экрана.
     local y = sizeY * 0.58
     imgui.SetNextWindowPos(V2(sizeX * 0.5, y), imgui.Cond.Always, V2(0.5, 0.5))
-    imgui.SetNextWindowSize(V2(272 * S, 0), imgui.Cond.Always)
+    imgui.SetNextWindowSize(V2(340 * S, 0), imgui.Cond.Always)
     imgui.SetNextWindowBgAlpha(0.92)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 8 * S)
-    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(11.2 * S, 8.8 * S))
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 10 * S)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(14 * S, 11 * S))
     local tint = sn.icon == 'success' and V4(0.22, 0.92, 0.58, 1)
         or sn.icon == 'warn' and V4(1.00, 0.72, 0.22, 1)
         or sn.icon == 'error' and V4(1.00, 0.32, 0.38, 1)
@@ -973,6 +1179,16 @@ local lastOrderCancelAt       = 0
 local lastOrderErrorAt        = 0
 local firstCatchWarnShown     = false
 
+-- Сохраняем заявку до истечения TTL без повторного пакета: сервер может не присылать
+-- полный список при каждом открытии телефона. Новые пакеты обновляют lastSeen и расстояние.
+local MOBILE_ORDER_TTL_SEC = 30
+
+local failedOrderIds = {}
+local lastFailedListRefreshAt = 0
+-- ID текущего принятого заказа. Нужен, чтобы после доставки удалить
+-- только завершённую заявку, сохранив остальные ещё актуальные заявки.
+local activeOrderId = nil
+
 local MOBILE_ORDER = {
     phase          = 'idle', -- idle | collecting | waiting_confirm
     collectStarted = 0,
@@ -988,7 +1204,7 @@ local MOBILE_ORDER = {
     selectedNick   = nil,
 }
 
-local function resetMobileOrder(cdSec)
+local function resetMobileOrder(cdSec, keepCandidates)
     MOBILE_ORDER.phase          = 'idle'
     MOBILE_ORDER.collectStarted = 0
     MOBILE_ORDER.collectUntil   = 0
@@ -996,14 +1212,16 @@ local function resetMobileOrder(cdSec)
     MOBILE_ORDER.nextRetryAt    = 0
     MOBILE_ORDER.retriesSent    = 0
     MOBILE_ORDER.holdUntil      = 0
-    MOBILE_ORDER.candidates     = {}
+    if not keepCandidates then
+        MOBILE_ORDER.candidates = {}
+    end
     MOBILE_ORDER.selectedId     = nil
     MOBILE_ORDER.selectedDist   = nil
     MOBILE_ORDER.selectedNick   = nil
     MOBILE_ORDER.cooldownUntil  = os.clock() + (cdSec or CATCH.MOBILE_COOLDOWN_SEC)
 end
 
-local function clearOrderState(cdSec, reason)
+local function clearOrderState(cdSec, reason, keepCandidates)
     hasActiveOrder          = false
     pendingAccept           = nil
     pendingDialogReply      = nil
@@ -1013,15 +1231,53 @@ local function clearOrderState(cdSec, reason)
     lastAcceptedDialogStyle = nil
     lastAcceptAt            = 0
     acceptConfirmExpire     = 0
-    resetMobileOrder(cdSec or CATCH.MOBILE_COOLDOWN_SEC)
+    if keepCandidates then
+        -- После успешной доставки удаляем только доставленный ID. Остальные
+        -- заявки могут всё ещё быть актуальны и не должны теряться.
+        if activeOrderId then
+            MOBILE_ORDER.candidates[tostring(activeOrderId)] = nil
+            logAct('Completed order removed from cache: id=' .. tostring(activeOrderId))
+        end
+    else
+        MOBILE_ORDER.candidates = {}
+        MOBILE_ORDER.lastRefreshAt = 0
+    end
+    activeOrderId = nil
+    failedOrderIds = {}
+    resetMobileOrder(cdSec or CATCH.MOBILE_COOLDOWN_SEC, keepCandidates)
     if reason then
         logAct('Order state cleared: ' .. tostring(reason))
     end
 end
 
+local function beginMobileOrderRefresh(reason)
+    if not CFG.catchEnabled or hasActiveOrder then return false end
+    local now = os.clock()
+    if MOBILE_ORDER.phase == 'collecting'
+        and (now - (tonumber(MOBILE_ORDER.collectStarted) or 0)) <= 0.25 then
+        return true
+    end
+    -- Expired entries are pruned by tickMobileClosestOrder(); keep this
+    -- function independent of the later-declared pruning helper.
+    failedOrderIds = {}
+    MOBILE_ORDER.phase = 'collecting'
+    MOBILE_ORDER.collectStarted = now
+    MOBILE_ORDER.collectUntil = now + mobileCollectInitialSec()
+    MOBILE_ORDER.cooldownUntil = 0
+    logAct('Phone order refresh started: ' .. tostring(reason or 'phone opened')
+        .. '; cached candidates=' .. tostring((function()
+            local n = 0
+            for _ in pairs(MOBILE_ORDER.candidates) do n = n + 1 end
+            return n
+        end)()))
+    return true
+end
+
 local function finishOrder(reason, resetOnly)
     pendingDialogReply = nil
-    resetMobileOrder(1.5)
+    if resetOnly then
+        resetMobileOrder(1.5)
+    end
     if resetOnly then
         if not hasActiveOrder and not pendingAccept and not awaitingDialog and MOBILE_ORDER.phase == 'idle' then
             if reason == 'manual' then
@@ -1034,13 +1290,32 @@ local function finishOrder(reason, resetOnly)
     else
         if not hasActiveOrder then return end
         STATS.sessionDone = STATS.sessionDone + 1
-        -- На сервере опыт за успешный заказ начисляется по +1; обновляем счётчик сразу,
-        -- не дожидаясь повторного открытия диалога навыка.
-        if type(STATS.expCur) == 'number' and type(STATS.expNeed) == 'number' then
+        -- Успешная доставка/оплата даёт один пункт опыта. finishOrder()
+        -- проходит только пока заказ активен; после clearOrderState повторное
+        -- сообщение по тому же заказу уже не сможет начислить XP второй раз.
+        if (reason == L'доставлен' or reason == L'спасибо')
+            and type(STATS.expCur) == 'number'
+            and type(STATS.expNeed) == 'number'
+            and STATS.expNeed > 0 then
             STATS.expCur = math.min(STATS.expNeed, STATS.expCur + 1)
+            logAct('Taxi XP locally updated after successful delivery: '
+                .. tostring(STATS.expCur) .. '/' .. tostring(STATS.expNeed)
+                .. ' | remaining=' .. tostring(expRemaining()))
+            dirty = true
         end
-        clearOrderState(2.0, 'order finished: ' .. tostring(reason))
+        -- После успешной доставки сразу открываем телефон, чтобы сервер
+        -- прислал актуальный список заказов для следующего цикла.
+        clearOrderState(1.0, 'order finished: ' .. tostring(reason), true)
+        logAct('Order cycle preserved valid cached candidates after delivery; waiting for phone refresh packets')
         notify(L'Заказ завершён (' .. tostring(reason) .. ')', 0x00FF00)
+        lua_thread.create(function()
+            wait(600)
+            if CFG.catchEnabled and not hasActiveOrder and type(sampSendChat) == 'function' then
+                sampSendChat('/phone')
+                beginMobileOrderRefresh('automatic /phone after delivery')
+                logAct('Phone opened after successful delivery; collecting refreshed and cached orders')
+            end
+        end)
     end
 end
 
@@ -1137,15 +1412,48 @@ local function extractOrderId(obj)
 end
 
 local function extractOrderDist(obj)
-    local keys = { 'distance', 'dist' }
+    -- В разных ответах сервера расстояние может быть числом или строкой:
+    -- "distance": 881, "distance": "881", "distance": "881 м".
+    -- Также встречаются альтернативные имена полей.
+    local keys = { 'distance', 'dist', 'distance_m', 'distanceMeters', 'meters', 'range' }
     for _, k in ipairs(keys) do
-        local rawDist = obj:match('"' .. k .. '"%s*:%s*([%-+]?%d+%.?%d*)')
-        local dist = tonumber(rawDist)
-        if isValidDistance(dist) then
-            return dist
+        local rawValue = obj:match('"' .. k .. '"%s*:%s*"([^"]+)"')
+        if not rawValue then
+            rawValue = obj:match('"' .. k .. '"%s*:%s*([%-+]?%d+[%.,]?%d*)')
+        end
+        if rawValue then
+            local rawDist = rawValue:match('[%-+]?%d+[%.,]?%d*')
+            if rawDist then
+                rawDist = rawDist:gsub(',', '.')
+                local dist = tonumber(rawDist)
+                local lowerValue = string.lower(rawValue)
+                if lowerValue:find('км', 1, true) or lowerValue:find('km', 1, true) then
+                    dist = dist and (dist * 1000) or nil
+                end
+                if isValidDistance(dist) then
+                    return dist
+                end
+            end
         end
     end
     return nil
+end
+
+local function pruneExpiredMobileCandidates(now)
+    now = tonumber(now) or os.clock()
+    local removed = 0
+    for id, item in pairs(MOBILE_ORDER.candidates) do
+        local lastSeen = item and tonumber(item.lastSeen) or 0
+        if lastSeen <= 0 or (now - lastSeen) >= MOBILE_ORDER_TTL_SEC then
+            MOBILE_ORDER.candidates[id] = nil
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then
+        logAct('Expired mobile order candidates removed: ' .. tostring(removed)
+            .. ' (TTL=' .. tostring(MOBILE_ORDER_TTL_SEC) .. 's)')
+    end
+    return removed
 end
 
 local function collectOrdersFromRaw(raw)
@@ -1153,57 +1461,113 @@ local function collectOrdersFromRaw(raw)
     if not slice or #slice < 8 then
         return false
     end
-    if not slice:find('"distance"', 1, true) and not slice:find('"dist"', 1, true) then
-        return false
+    local hasDistanceField = false
+    for _, key in ipairs({ '"distance"', '"dist"', '"distance_m"', '"distanceMeters"', '"meters"', '"range"' }) do
+        if slice:find(key, 1, true) then
+            hasDistanceField = true
+            break
+        end
     end
+    if not hasDistanceField then return false end
 
     local added = false
-    for obj in slice:gmatch('{[^{}]+}') do
-        if not isOrderActiveTaken(obj) then
-            local id = extractOrderId(obj)
-            local dist = extractOrderDist(obj)
-            if id and dist then
-                local nick = extractOrderNick(obj)
-                local existing = MOBILE_ORDER.candidates[id]
-                if not existing or dist < existing.distance then
-                    MOBILE_ORDER.candidates[id] = {
-                        id       = id,
-                        distance = dist,
-                        nick     = nick or (existing and existing.nick) or nil,
-                    }
-                elseif nick and not existing.nick then
-                    existing.nick = nick
-                end
-                added = true
+    local function considerOrderObject(obj)
+        -- Не анализируем контейнеры с вложенными объектами: иначе id одного
+        -- пассажира может сочетаться с distance другого из дочернего объекта.
+        if obj:find('{', 2, true) then return end
+        local taken = isOrderActiveTaken(obj)
+        local id = extractOrderId(obj)
+        local dist = extractOrderDist(obj)
+        if taken then
+            logAct('Order object skipped as active/taken: ' .. obj:sub(1, 500))
+        elseif not id or not dist then
+            -- Вложенные JSON-объекты тоже проверяются отдельно. Не пишем шум
+            -- в лог для коротких служебных объектов без полей заказа.
+            if id or dist then
+                logAct('Order object not parsed (id=' .. tostring(id) .. ', distance=' .. tostring(dist) .. '): ' .. obj:sub(1, 500))
+            end
+        else
+            local nick = extractOrderNick(obj)
+            local existing = MOBILE_ORDER.candidates[id]
+            MOBILE_ORDER.candidates[id] = {
+                id       = id,
+                distance = dist,
+                nick     = nick or (existing and existing.nick) or nil,
+                lastSeen = os.clock(),
+            }
+            logAct(string.format('Candidate stored: id=%s nick=%s distance=%.1fm TTL=%ds',
+                tostring(id), tostring(nick or (existing and existing.nick) or '-'),
+                tonumber(dist), MOBILE_ORDER_TTL_SEC))
+            added = true
+        end
+    end
+
+    -- Балансный разбор скобок вместо шаблона {[^{}]+}: шаблон терял внешние
+    -- записи, если сервер вкладывает объект заказа в data/result/payload.
+    -- Учитываем кавычки и экранирование, чтобы фигурные скобки в строках
+    -- не ломали границы JSON-объектов.
+    local stack = {}
+    local inString, escaped = false, false
+    for i = 1, #slice do
+        local ch = slice:sub(i, i)
+        if inString then
+            if escaped then
+                escaped = false
+            elseif ch == '\\' then
+                escaped = true
+            elseif ch == '"' then
+                inString = false
+            end
+        else
+            if ch == '"' then
+                inString = true
+            elseif ch == '{' then
+                stack[#stack + 1] = i
+            elseif ch == '}' and #stack > 0 then
+                local startPos = stack[#stack]
+                stack[#stack] = nil
+                considerOrderObject(slice:sub(startPos, i))
             end
         end
     end
     return added
 end
 
-local failedOrderIds = {}
-
 local function selectClosestOrder()
-    local sorted = {}
+    pruneExpiredMobileCandidates(os.clock())
+    local allValid = {}
+    local withinLimit = {}
     for _, item in pairs(MOBILE_ORDER.candidates) do
-        if item and item.id and not failedOrderIds[tostring(item.id)] and isValidDistance(item.distance)
-            and (maxOrderDistance[0] <= 0 or tonumber(item.distance) <= maxOrderDistance[0]) then
-            sorted[#sorted + 1] = {
+        if item and item.id and not failedOrderIds[tostring(item.id)] and isValidDistance(item.distance) then
+            local candidate = {
                 id       = tostring(item.id),
                 distance = tonumber(item.distance),
                 nick     = item.nick,
             }
+            allValid[#allValid + 1] = candidate
+            if maxOrderDistance[0] <= 0 or candidate.distance <= maxOrderDistance[0] then
+                withinLimit[#withinLimit + 1] = candidate
+            end
         end
     end
 
-    table.sort(sorted, function(a, b)
-        if math.abs(a.distance - b.distance) > 0.001 then
-            return a.distance < b.distance
-        end
-        return (tonumber(a.id) or 0) < (tonumber(b.id) or 0)
-    end)
+    local function sortByDistance(list)
+        table.sort(list, function(a, b)
+            if math.abs(a.distance - b.distance) > 0.001 then
+                return a.distance < b.distance
+            end
+            return (tonumber(a.id) or 0) < (tonumber(b.id) or 0)
+        end)
+    end
+    sortByDistance(withinLimit)
+    sortByDistance(allValid)
 
-    return sorted[1], #sorted, sorted
+    -- Ограничение расстояния является строгим: заказы за пределами
+    -- установленного лимита никогда не передаются в очередь принятия.
+    if #withinLimit > 0 then
+        return withinLimit[1], #withinLimit, withinLimit, false
+    end
+    return nil, 0, allValid, (#allValid > 0)
 end
 
 local function formatDistanceStr(dist)
@@ -1222,6 +1586,8 @@ local function reportClosestOrder(best, total)
 end
 
 local function retryNextMobileCandidate(reason)
+    -- Считаем текущий ID неудачным и выбираем следующего из уже сохранённого
+    -- списка MOBILE_ORDER.candidates. Нового пакета от сервера для этого не ждём.
     local failedId = MOBILE_ORDER.selectedId and tostring(MOBILE_ORDER.selectedId) or nil
     if failedId then failedOrderIds[failedId] = true end
     pendingAccept = nil
@@ -1239,62 +1605,168 @@ local function retryNextMobileCandidate(reason)
         MOBILE_ORDER.selectedDist = best.distance
         MOBILE_ORDER.selectedNick = best.nick
         MOBILE_ORDER.phase = 'waiting_confirm'
-        MOBILE_ORDER.confirmUntil = os.clock() + CATCH.MOBILE_CONFIRM_SEC
-        MOBILE_ORDER.holdUntil = os.clock() + CATCH.MOBILE_HOLD_SEC
+        MOBILE_ORDER.confirmUntil = os.clock() + mobileConfirmTimeoutSec()
+        MOBILE_ORDER.holdUntil = os.clock() + (CFG.turboCatch and 0.08 or 0.45)
         MOBILE_ORDER.retriesSent = 0
-        MOBILE_ORDER.nextRetryAt = os.clock() + CATCH.MOBILE_RETRY_SEC
+        MOBILE_ORDER.nextRetryAt = os.clock() + mobileRetryIntervalSec()
         MOBILE_ORDER.cooldownUntil = 0
         pendingAccept = os.clock()
         awaitingDialog = true
-        awaitingExpire = os.clock() + CATCH.MOBILE_CONFIRM_SEC
-        logAct('Order failed (' .. tostring(reason) .. '), skipping id=' .. tostring(failedId) .. '; next id=' .. tostring(best.id) .. ' dist=' .. tostring(best.distance))
+        awaitingExpire = os.clock() + mobileConfirmTimeoutSec()
+        logAct('PICK RESULT: failed id=' .. tostring(failedId) .. ' reason=' .. tostring(reason) .. '; next eligible id=' .. tostring(best.id) .. ' dist=' .. tostring(best.distance))
         notify(L'Заказ не принят. Пробую следующий: ' .. tostring(best.nick or L'Без имени') .. L' (' .. formatDistanceStr(best.distance) .. L')', 0xFFAA00)
         sendMobilePickOrder(best.id, 0)
         return true
     end
 
-    logAct('Order failed (' .. tostring(reason) .. '); no remaining candidates in current list')
-    resetMobileOrder(1.0)
+    -- Все ID из текущего списка исчерпаны (или сервер отклонил их).
+    -- Не ждём нового события о пассажире: принудительно запрашиваем список
+    -- через телефон. Ограничиваем частоту, чтобы не зациклить /phone.
+    local now = os.clock()
+    logAct('PICK RESULT: no next candidate; reason=' .. tostring(reason) .. '; requesting fresh phone list')
+    resetMobileOrder(0.10)
     failedOrderIds = {}
-    notify(L'Заказ не принят. Других доступных заказов в текущем списке нет', 0xFFAA00)
+    notify(L'Заказы из списка исчерпаны. Обновляю список...', 0xFFAA00)
+    if now - (tonumber(lastFailedListRefreshAt) or 0) >= 1.25 then
+        lastFailedListRefreshAt = now
+        sampSendChat('/phone')
+        beginMobileOrderRefresh('automatic /phone after failed candidates')
+    else
+        -- Если /phone только что открывался, всё равно повторно запускаем
+        -- сбор по уже поступающим пакетам, не ожидая нового сообщения в чате.
+        beginMobileOrderRefresh('resume collection after failed candidates')
+    end
     return false
 end
 
 local function taxiOnReceivePacket(id, bs)
-    if id == 220 and CFG.catchEnabled and not hasActiveOrder and os.clock() >= MOBILE_ORDER.cooldownUntil then
-        if MOBILE_ORDER.phase == 'idle' or MOBILE_ORDER.phase == 'collecting' then
-            local off = raknetBitStreamGetReadOffset(bs)
-            local ok, raw = pcall(function()
-                raknetBitStreamReadInt8(bs) -- 220
-                raknetBitStreamReadInt8(bs) -- sub
-                raknetBitStreamReadInt8(bs)
-                raknetBitStreamReadInt8(bs)
-                raknetBitStreamReadInt8(bs)
-                raknetBitStreamReadInt8(bs)
-                local used = raknetBitStreamGetNumberOfBytesUsed(bs)
-                local curByte = math.floor(raknetBitStreamGetReadOffset(bs) / 8)
-                local rem = (used or 0) - curByte
-                if rem > 0 and rem < 32768 then
-                    return raknetBitStreamReadString(bs, rem)
-                end
-                return nil
-            end)
-            raknetBitStreamSetReadOffset(bs, off)
+    -- Список заказов может приходить несколькими пакетами, в том числе уже
+    -- после первой попытки выбора. Поэтому продолжаем разбирать список и в
+    -- фазе waiting_confirm, а не только до первой отправки PickOrder.
+    if id ~= 220 or not CFG.catchEnabled or hasActiveOrder then
+        return
+    end
 
-            if ok and type(raw) == 'string' and #raw > 0 then
-                if collectOrdersFromRaw(raw) then
-                    local now = os.clock()
-                    if MOBILE_ORDER.phase == 'idle' then
-                        failedOrderIds = {}
-                        MOBILE_ORDER.phase = 'collecting'
-                        MOBILE_ORDER.collectStarted = now
-                        MOBILE_ORDER.collectUntil = now + CATCH.MOBILE_COLLECT_SEC
-                    else
-                        local maxUntil = MOBILE_ORDER.collectStarted + CATCH.MOBILE_COLLECT_MAX
-                        MOBILE_ORDER.collectUntil = math.min(maxUntil, math.max(MOBILE_ORDER.collectUntil, now + 0.15))
-                    end
-                end
-            end
+    local off = raknetBitStreamGetReadOffset(bs)
+    local ok, raw = pcall(function()
+        raknetBitStreamReadInt8(bs) -- packet id
+        raknetBitStreamReadInt8(bs) -- sub
+        raknetBitStreamReadInt8(bs)
+        raknetBitStreamReadInt8(bs)
+        raknetBitStreamReadInt8(bs)
+        raknetBitStreamReadInt8(bs)
+        local used = raknetBitStreamGetNumberOfBytesUsed(bs)
+        local curByte = math.floor(raknetBitStreamGetReadOffset(bs) / 8)
+        local rem = (used or 0) - curByte
+        if rem > 0 and rem < 32768 then
+            return raknetBitStreamReadString(bs, rem)
+        end
+        return nil
+    end)
+    raknetBitStreamSetReadOffset(bs, off)
+
+    if not ok or type(raw) ~= 'string' or #raw == 0 then return end
+
+    local packetNow = os.clock()
+    local lastPacketAt = tonumber(MOBILE_ORDER.lastRefreshAt) or 0
+
+    -- Диагностика структуры обновления списка заказов.
+    -- Не удаляем кандидатов по отдельным пакетам: сервер может присылать
+    -- один список несколькими частями. По этим записям определим реальную
+    -- границу полного обновления и только после этого включим безопасную очистку.
+    local diagnosticSlice = extractJsonSlice(raw)
+    if diagnosticSlice and #diagnosticSlice > 0 then
+        local hasDistance = diagnosticSlice:find('"distance"', 1, true)
+            or diagnosticSlice:find('"dist"', 1, true)
+            or diagnosticSlice:find('"distance_m"', 1, true)
+            or diagnosticSlice:find('"distanceMeters"', 1, true)
+            or diagnosticSlice:find('"meters"', 1, true)
+            or diagnosticSlice:find('"range"', 1, true)
+        if hasDistance then
+            local packetText = diagnosticSlice:gsub('[\r\n]+', ' ')
+            logRaw('ORDER_PACKET', 'bytes=' .. tostring(#raw)
+                .. ' slice=' .. tostring(#diagnosticSlice)
+                .. ' data=' .. packetText:sub(1, 2200)
+                .. (#packetText > 2200 and '...[TRUNCATED]' or ''))
+        end
+    end
+
+    -- Пакеты RakNet 220 содержат много несвязанных служебных данных.
+    -- Кэш очищаем только при новом JSON-пакете с признаками записи заказа,
+    -- а не при любом постороннем пакете (0/1 байт, координаты, интерфейсы и т.п.).
+    local looksLikeOrderPayload = diagnosticSlice
+        and diagnosticSlice:find('"id"', 1, true)
+        and (diagnosticSlice:find('"distance"', 1, true)
+            or diagnosticSlice:find('"dist"', 1, true)
+            or diagnosticSlice:find('"distance_m"', 1, true)
+            or diagnosticSlice:find('"distanceMeters"', 1, true)
+            or diagnosticSlice:find('"meters"', 1, true)
+            or diagnosticSlice:find('"range"', 1, true))
+    if looksLikeOrderPayload and MOBILE_ORDER.phase == 'idle'
+        and (lastPacketAt <= 0 or (packetNow - lastPacketAt) > 2.5) then
+        MOBILE_ORDER.candidates = {}
+        logAct('Stale order cache cleared on valid order payload')
+    end
+
+    if not collectOrdersFromRaw(raw) then
+        local slice = extractJsonSlice(raw) or ''
+        if #slice > 0 then
+            local compact = slice:gsub('[\r\n]+', ' ')
+            logRaw('ORDER_PACKET', 'UNPARSED bytes=' .. tostring(#raw)
+                .. ' json=' .. tostring(#slice) .. ' data=' .. compact:sub(1, 1800)
+                .. (#compact > 1800 and '...[TRUNCATED]' or ''))
+        else
+            logAct('Order packet received but no JSON array/object found; bytes=' .. tostring(#raw)
+                .. ' raw=' .. tostring(raw):sub(1, 500))
+        end
+        return
+    end
+
+    local now = os.clock()
+    MOBILE_ORDER.lastRefreshAt = now
+    logAct(string.format('Order packet accepted: phase=%s cooldown=%.2fs candidates=%d',
+        tostring(MOBILE_ORDER.phase), math.max(0, MOBILE_ORDER.cooldownUntil - now),
+        (function() local n = 0; for _ in pairs(MOBILE_ORDER.candidates) do n = n + 1 end; return n end)()))
+    if MOBILE_ORDER.phase == 'idle' and now < MOBILE_ORDER.cooldownUntil then
+        logAct('Candidate stored during cooldown; selection deferred')
+        return
+    end
+    if MOBILE_ORDER.phase == 'idle' then
+        failedOrderIds = {}
+        MOBILE_ORDER.phase = 'collecting'
+        MOBILE_ORDER.collectStarted = now
+        MOBILE_ORDER.collectUntil = now + mobileCollectInitialSec()
+        logAct(string.format('Order list packet received -> %s collection started (initial=%.2fs quiet=%.2fs max=%.2fs)',
+            CFG.turboCatch and 'TURBO' or 'SAFE', mobileCollectInitialSec(), mobileCollectQuietSec(), mobileCollectMaxSec()))
+    elseif MOBILE_ORDER.phase == 'collecting' then
+        local maxUntil = MOBILE_ORDER.collectStarted + mobileCollectMaxSec()
+        MOBILE_ORDER.collectUntil = math.min(maxUntil,
+            math.max(MOBILE_ORDER.collectUntil, now + mobileCollectQuietSec()))
+    elseif MOBILE_ORDER.phase == 'waiting_confirm' then
+        -- Если после начала ловли пришла ещё одна часть/обновление списка,
+        -- немедленно переключаемся на более близкий заказ.
+        local best = selectClosestOrder()
+        if best and best.id ~= tostring(MOBILE_ORDER.selectedId or '')
+            and (not MOBILE_ORDER.selectedDist
+                or best.distance + 0.10 < tonumber(MOBILE_ORDER.selectedDist)) then
+            local oldId = MOBILE_ORDER.selectedId
+            local oldDist = MOBILE_ORDER.selectedDist
+            MOBILE_ORDER.selectedId = best.id
+            MOBILE_ORDER.selectedDist = best.distance
+            MOBILE_ORDER.selectedNick = best.nick
+            MOBILE_ORDER.retriesSent = 0
+            MOBILE_ORDER.confirmUntil = now + mobileConfirmTimeoutSec()
+            MOBILE_ORDER.holdUntil = now + (CFG.turboCatch and 0.04 or 0.45)
+            MOBILE_ORDER.nextRetryAt = now + mobileRetryIntervalSec()
+            pendingAccept = now
+            awaitingDialog = true
+            awaitingExpire = now + mobileConfirmTimeoutSec()
+            logAct(string.format('CLOSER ORDER SWITCH: old id=%s oldDist=%s -> new id=%s newDist=%.1fm mode=%s',
+                tostring(oldId), tostring(oldDist), tostring(best.id), best.distance,
+                CFG.turboCatch and 'TURBO' or 'SAFE'))
+            notify(L'В списке найден заказ ближе: ' .. tostring(best.nick or L'Без имени')
+                .. L' (' .. string.format('%.0f м', best.distance) .. L')', 0x00CCB3)
+            sendMobilePickOrder(best.id, 0)
         end
     end
 end
@@ -1338,6 +1810,64 @@ local function isPlayerMessage(text)
     return false
 end
 
+function sampev.onSendCommand(command)
+    local cmd = tostring(command or ''):gsub('^%s+', ''):gsub('%s+$', ''):lower()
+    cmd = cmd:gsub('^/', '')
+    if cmd == 'phone' and CFG.catchEnabled and not hasActiveOrder then
+        -- Не сбрасываем ожидание подтверждения уже отправленного PickOrder.
+        -- Новые пакеты всё равно будут разобраны в фазе waiting_confirm.
+        if MOBILE_ORDER.phase ~= 'waiting_confirm' then
+            beginMobileOrderRefresh('manual /phone command')
+        else
+            logAct('Phone opened during order confirmation; keeping selected order and accepting refreshed packets')
+        end
+    end
+end
+
+local lastTaxiPaymentText = nil
+local lastTaxiPaymentAt = 0
+
+local function recordTaxiPayment(cleanRaw, cleanN, now)
+    if cleanN:find(L'[такси]', 1, true) == nil
+        or cleanN:find(L'клиент оплатил', 1, true) == nil then
+        return false
+    end
+
+    -- Сумма берётся именно из серверной строки оплаты, а не из дельты баланса.
+    -- Точки/запятые/пробелы в записи суммы являются разделителями тысяч.
+    local grossText = cleanRaw:match('%$%s*([%d][%d%.,%s]*)')
+    if not grossText then
+        logAct('TAXI PAYMENT: message detected but gross amount was not parsed: ' .. tostring(cleanRaw))
+        return false
+    end
+    local gross = tonumber((grossText:gsub('[^%d]', '')))
+    if not gross or gross <= 0 then
+        logAct('TAXI PAYMENT: invalid gross amount in message: ' .. tostring(cleanRaw))
+        return false
+    end
+
+    local commissionText = cleanRaw:match(L'комиссия%s*:%s*%$?%s*([%d][%d%.,%s]*)')
+    local commission = commissionText and tonumber((commissionText:gsub('[^%d]', ''))) or 0
+    if not commission then commission = 0 end
+    local earned = math.max(0, gross - commission)
+
+    -- Защита от повторной доставки одной и той же строки хуком чата.
+    if lastTaxiPaymentText == cleanRaw and (now - lastTaxiPaymentAt) < 1.5 then
+        logAct('TAXI PAYMENT: duplicate server message ignored: ' .. tostring(cleanRaw))
+        return true
+    end
+    lastTaxiPaymentText = cleanRaw
+    lastTaxiPaymentAt = now
+
+    st.money = st.money + earned
+    mark()
+    logAct('TAXI PAYMENT ADDED: gross=$' .. tostring(gross)
+        .. ' commission=$' .. tostring(commission)
+        .. ' net=+$' .. tostring(earned)
+        .. ' session=$' .. tostring(st.money))
+    return true
+end
+
 function sampev.onServerMessage(color, text)
     local isPlayer = isPlayerMessage(text)
     local cleanRaw = stripColors(text)
@@ -1345,6 +1875,17 @@ function sampev.onServerMessage(color, text)
 
     local cleanN = normalize(cleanRaw)
     local now = os.clock()
+
+    if not isPlayer then
+        recordTaxiPayment(cleanRaw, cleanN, now)
+    end
+
+    -- Обновляем опыт также по явным серверным сообщениям, не ожидая повторного
+    -- открытия диалога навыка. Не начисляем опыт предположительно: принимаем
+    -- только фактические числа, присланные сервером.
+    if not isPlayer and cleanN:find(L'опыт', 1, true) then
+        parseTaxiStatsFromDialog(L'Навык такси', cleanRaw)
+    end
 
     -- Auto SPORT: точный триггер из предоставленного пользователем AutoStyle.
     -- Серверное уведомление о назначении стиля запускает /style; игроковые сообщения не фильтруем,
@@ -1412,7 +1953,8 @@ function sampev.onServerMessage(color, text)
         -- очищает selectedNick/selectedDist.
         local acceptedNick = MOBILE_ORDER.selectedNick or L'Без имени'
         local acceptedDist = MOBILE_ORDER.selectedDist
-        resetMobileOrder(3.0)
+        activeOrderId = MOBILE_ORDER.selectedId and tostring(MOBILE_ORDER.selectedId) or activeOrderId
+        resetMobileOrder(3.0, true)
         hasActiveOrder         = true
         orderConfirmedByServer = true
         pendingAccept          = nil
@@ -1453,11 +1995,19 @@ function sampev.onServerMessage(color, text)
     if isOrderChatLine and CFG.catchEnabled and not hasActiveOrder and now >= MOBILE_ORDER.cooldownUntil and now >= taxiErrorBlockUntil then
         if MOBILE_ORDER.phase == 'idle' then
             failedOrderIds = {}
-            MOBILE_ORDER.candidates     = {}
+            pruneExpiredMobileCandidates(now)
+            local lastPacketAt = tonumber(MOBILE_ORDER.lastRefreshAt) or 0
+            -- Старые кандидаты не должны конкурировать с новым списком заказов.
+            -- Сохраняем только пакеты, пришедшие непосредственно перед строкой чата.
+            if lastPacketAt <= 0 or (now - lastPacketAt) > 1.5 then
+                MOBILE_ORDER.candidates = {}
+                logAct('Stale order cache cleared before fresh collection')
+            end
             MOBILE_ORDER.phase          = 'collecting'
             MOBILE_ORDER.collectStarted = now
-            MOBILE_ORDER.collectUntil   = now + CATCH.MOBILE_COLLECT_SEC
-            logAct('New order chat trigger -> collecting closest order')
+            MOBILE_ORDER.collectUntil   = now + mobileCollectInitialSec()
+            logAct(string.format('New order chat trigger -> %s collection initial=%.2fs quiet=%.2fs max=%.2fs',
+                CFG.turboCatch and 'TURBO' or 'SAFE', mobileCollectInitialSec(), mobileCollectQuietSec(), mobileCollectMaxSec()))
         end
     end
 end
@@ -1549,11 +2099,25 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         or (isConfirmTitle and hasOrderBody)
         or (b1N:find(L'принять', 1, true) and hasOrderBody)
 
+    if isOrderDialog then
+        -- Серверный диалог содержит имя даже если список заказов не успел
+        -- распознаться (например, при закрытом телефоне).
+        local dialogNick = cleanBody:match('[Ии]мя:%s*([^\r\n]+)')
+        if dialogNick then
+            dialogNick = dialogNick:gsub('^%s+', ''):gsub('%s+$', '')
+            if dialogNick ~= '' then
+                MOBILE_ORDER.selectedNick = dialogNick
+                logAct('Customer name captured from accept dialog: ' .. dialogNick)
+            end
+        end
+    end
+
     if isOrderDialog and CFG.catchEnabled then
         if CFG.autoAccept and (((isPendingCatch or idNum == 15324) and not hasActiveOrder) or isTwoStepConfirm) then
             if not hasActiveOrder then
             end
             hasActiveOrder          = true
+            activeOrderId           = MOBILE_ORDER.selectedId and tostring(MOBILE_ORDER.selectedId) or activeOrderId
             pendingAccept           = nil
             awaitingDialog          = false
             lastAcceptedDialogId    = id
@@ -1644,11 +2208,26 @@ end
 -- ============================================================
 
 local function tickMobileClosestOrder(now)
+    pruneExpiredMobileCandidates(now)
+    MOBILE_ORDER.lastRefreshAt = MOBILE_ORDER.lastRefreshAt or 0
     if not CFG.catchEnabled or hasActiveOrder or now < taxiErrorBlockUntil then
         if MOBILE_ORDER.phase ~= 'idle' then
             resetMobileOrder(1.0)
         end
         return
+    end
+
+    -- Пакеты, пришедшие во время короткого cooldown, уже сохранены.
+    -- Не теряем их: начинаем сбор сразу после окончания cooldown.
+    if MOBILE_ORDER.phase == 'idle'
+        and now >= MOBILE_ORDER.cooldownUntil
+        and next(MOBILE_ORDER.candidates) ~= nil
+        and (now - (tonumber(MOBILE_ORDER.lastRefreshAt) or 0)) <= 3.0 then
+        MOBILE_ORDER.phase = 'collecting'
+        MOBILE_ORDER.collectStarted = now
+        MOBILE_ORDER.collectUntil = now + mobileCollectInitialSec()
+        logAct(string.format('Deferred %s order collection started (initial=%.2fs quiet=%.2fs max=%.2fs)',
+            CFG.turboCatch and 'TURBO' or 'SAFE', mobileCollectInitialSec(), mobileCollectQuietSec(), mobileCollectMaxSec()))
     end
 
     if MOBILE_ORDER.phase == 'collecting' and now >= MOBILE_ORDER.collectUntil then
@@ -1659,41 +2238,84 @@ local function tickMobileClosestOrder(now)
                 parts[#parts + 1] = string.format('#%s(%s,%.1fm)',
                     all[i].id, tostring(all[i].nick or '-'), all[i].distance)
             end
-            logAct('Candidates (' .. tostring(total) .. '): ' .. table.concat(parts, ', '))
+            logAct('Candidates (' .. tostring(total) .. ', mode=' .. (CFG.turboCatch and 'TURBO' or 'SAFE') .. '): ' .. table.concat(parts, ', '))
 
             MOBILE_ORDER.selectedId   = best.id
             MOBILE_ORDER.selectedDist = best.distance
             MOBILE_ORDER.selectedNick = best.nick
             MOBILE_ORDER.phase        = 'waiting_confirm'
-            MOBILE_ORDER.confirmUntil = now + CATCH.MOBILE_CONFIRM_SEC
-            MOBILE_ORDER.holdUntil    = now + CATCH.MOBILE_HOLD_SEC
+            MOBILE_ORDER.confirmUntil = now + mobileConfirmTimeoutSec()
+            MOBILE_ORDER.holdUntil    = now + (CFG.turboCatch and 0.04 or 0.45)
             MOBILE_ORDER.retriesSent  = 0
-            MOBILE_ORDER.nextRetryAt  = now + CATCH.MOBILE_RETRY_SEC
+            MOBILE_ORDER.nextRetryAt  = now + mobileRetryIntervalSec()
             pendingAccept             = now
             awaitingDialog            = true
-            awaitingExpire            = now + CATCH.MOBILE_CONFIRM_SEC
+            awaitingExpire            = now + mobileConfirmTimeoutSec()
 
             reportClosestOrder(best, total)
             sendMobilePickOrder(best.id, 0)
-            logAct(string.format('Closest of %d: id=%s dist=%g nick=%s',
-                total, best.id, best.distance, tostring(best.nick or '-')))
-            notify(L'Выбран ' .. tostring(best.nick or L'Без имени') .. ' (' .. formatDistanceStr(best.distance) .. ')', 0x00CCB3)
-        else
-            if maxOrderDistance[0] > 0 then
-                logAct(string.format('No orders within max distance %d m; all candidates filtered', maxOrderDistance[0]))
-                notify(L'Нет заказов в пределах ' .. tostring(maxOrderDistance[0]) .. L' м', 0xFFAA00)
+            logAct(string.format('PICK DECISION: eligible=yes id=%s dist=%.1fm limit=%dm candidates=%d; sending request',
+                best.id, best.distance, maxOrderDistance[0], total))
+            if maxOrderDistance[0] > 0 and best.distance > maxOrderDistance[0] then
+                logAct(string.format('No orders within %dm; fallback to nearest available id=%s distance=%.1fm',
+                    maxOrderDistance[0], tostring(best.id), best.distance))
+                notify(L'В пределах лимита заказов нет. Беру ближайший: ' .. tostring(best.nick or L'Без имени') .. ' (' .. formatDistanceStr(best.distance) .. ')', 0x00CCB3)
+            else
+                notify(L'Выбран ' .. tostring(best.nick or L'Без имени') .. ' (' .. formatDistanceStr(best.distance) .. ')', 0x00CCB3)
             end
-            resetMobileOrder(1.0)
+        else
+            local inventory = {}
+            local validCount, outsideCount = 0, 0
+            for cid, candidate in pairs(MOBILE_ORDER.candidates) do
+                local dist = tonumber(candidate.distance)
+                local age = math.max(0, now - (tonumber(candidate.lastSeen) or now))
+                local valid = isValidDistance(dist)
+                if valid then validCount = validCount + 1 end
+                if valid and maxOrderDistance[0] > 0 and dist > maxOrderDistance[0] then
+                    outsideCount = outsideCount + 1
+                end
+                inventory[#inventory + 1] = string.format('#%s=%sm age=%.2fs %s', tostring(cid),
+                    tostring(candidate.distance), age,
+                    (not valid and 'INVALID') or ((maxOrderDistance[0] > 0 and dist > maxOrderDistance[0]) and 'TOO_FAR' or 'ELIGIBLE'))
+            end
+            table.sort(inventory)
+            logAct(string.format('NO PICK: candidates=%d valid=%d outside_limit=%d max_distance=%dm [%s]',
+                #inventory, validCount, outsideCount, maxOrderDistance[0], table.concat(inventory, ', ')))
+            if #inventory == 0 then
+                notify(L'Ожидаю обновление списка заказов...', 0xFFAA00)
+            elseif outsideCount == validCount and validCount > 0 then
+                notify(L'Все распознанные заказы дальше лимита ' .. tostring(maxOrderDistance[0]) .. L' м', 0xFFAA00)
+            end
+            -- Не очищаем таблицу кандидатов из-за одного пустого прохода:
+            -- заказы дальше порога остаются в памяти до TTL и могут быть
+            -- переоценены при изменении лимита или поступлении новых пакетов.
+            MOBILE_ORDER.phase = 'idle'
+            MOBILE_ORDER.collectStarted = 0
+            MOBILE_ORDER.collectUntil = 0
+            MOBILE_ORDER.confirmUntil = 0
+            MOBILE_ORDER.nextRetryAt = 0
+            MOBILE_ORDER.retriesSent = 0
+            MOBILE_ORDER.holdUntil = 0
+            MOBILE_ORDER.selectedId = nil
+            MOBILE_ORDER.selectedDist = nil
+            MOBILE_ORDER.selectedNick = nil
+            MOBILE_ORDER.cooldownUntil = now + 0.35
         end
     elseif MOBILE_ORDER.phase == 'waiting_confirm' then
         if now >= MOBILE_ORDER.confirmUntil then
+            -- Сервер не подтвердил текущий ID за короткое окно: исключаем его
+            -- и сразу пробуем следующий заказ из уже полученного списка.
             retryNextMobileCandidate('selection confirmation timeout')
         elseif not hasActiveOrder
            and MOBILE_ORDER.selectedId
            and now >= MOBILE_ORDER.nextRetryAt
            and MOBILE_ORDER.retriesSent < CATCH.MOBILE_MAX_RETRIES then
             MOBILE_ORDER.retriesSent = MOBILE_ORDER.retriesSent + 1
-            MOBILE_ORDER.nextRetryAt = now + CATCH.MOBILE_RETRY_SEC
+            MOBILE_ORDER.nextRetryAt = now + mobileRetryIntervalSec()
+            logAct(string.format('PICK RETRY: attempt=%d/%d id=%s distance=%s next_check=%.2fs',
+                MOBILE_ORDER.retriesSent, CATCH.MOBILE_MAX_RETRIES,
+                tostring(MOBILE_ORDER.selectedId), tostring(MOBILE_ORDER.selectedDist),
+                math.max(0, MOBILE_ORDER.nextRetryAt - now)))
             sendMobilePickOrder(MOBILE_ORDER.selectedId, MOBILE_ORDER.retriesSent)
         end
     end
@@ -1735,6 +2357,7 @@ local taxiSampev = sampev
 
 
     TAXI_STATS = STATS
+    TAXI_RESET_STATS = resetTaxiSessionStats
     TAXI_MOBILE_ORDER = MOBILE_ORDER
     TAXI_LOAD_CFG = loadTaxiCfg
     TAXI_TICK = tickAutoCatch
@@ -1747,8 +2370,6 @@ local taxiSampev = sampev
     TAXI_SET_AUTO_ACCEPT = function(v) CFG.autoAccept = v and true or false end
     TAXI_GET_TURBO = function() return CFG.turboCatch end
     TAXI_SET_TURBO = function(v) CFG.turboCatch = v and true or false; markDirty(); saveTaxiCfg() end
-    TAXI_RESET_SESSION = resetTaxiSessionStats
-    resetTaxiSessionStats = resetTaxiSessionStats -- export to outer main()/chat command
 
     -- Автолок перенесён из Road Helper без изменения последовательности команд.
     function sampev.onSendEnterVehicle(vehicleId, passenger)
@@ -1791,6 +2412,13 @@ local taxiSampev = sampev
     end
 
     -- Обработчик checkpoint регистрируется в области видимости локальной sampev.
+    -- Обычные и гоночные чекпоинты: серверы такси могут использовать любой тип.
+    function sampev.onSetCheckpoint(position, radius)
+        if position then taxiMarkerX, taxiMarkerY = position.x, position.y end
+    end
+    function sampev.onDisableCheckpoint()
+        taxiMarkerX, taxiMarkerY = nil, nil
+    end
     function sampev.onSetRaceCheckpoint(checkpointType, position, nextPosition, size)
         if position then taxiMarkerX, taxiMarkerY = position.x, position.y end
     end
@@ -1807,10 +2435,51 @@ function onReceivePacket(id, bs)
     raknetBitStreamIgnoreBits(bs, 8)
     local p = raknetBitStreamReadInt8(bs)
 
-    if p == 84 then
+    if p == 17 then
+        raknetBitStreamIgnoreBits(bs, 32)
+        local len = raknetBitStreamReadInt16(bs)
+        local enc = raknetBitStreamReadInt8(bs)
+        local cmd
+        if enc == 0 then
+            cmd = raknetBitStreamReadString(bs, len)
+        else
+            cmd = raknetBitStreamDecodeString(bs, len + enc)
+        end
+        cmd = tostring(cmd or "")
+        if #cmd > 220 then cmd = cmd:sub(1, 220) end
+        if string.find(cmd, "Clicker", 1, true)
+            or string.find(cmd, "clicker.setProgress", 1, true)
+            or string.find(cmd, "clickMinigame", 1, true) then
+            clicker = true
+        end
+
+        if string.find(cmd, "event.setActiveView", 1, true) and string.find(cmd, "null", 1, true) then
+            clicker = false
+        end
+
+        if featureOn(autoCaptcha) then
+            if string.find(cmd, "FindGame", 1, true) or string.find(cmd, "findGame", 1, true) then
+                lua_thread.create(function()
+                    wait(75)
+                    if not featureOn(autoCaptcha) then return end
+                    for i = 1, 6 do
+                        if not featureOn(autoCaptcha) then return end
+                        sendCef("findGame.Success")
+                        wait(90)
+                    end
+                    if featureOn(autoCaptcha) then sendCef("findGame.finish") end
+                end)
+            end
+        end
+
+    elseif p == 84 then
         local iid = raknetBitStreamReadInt8(bs)
         local sub = raknetBitStreamReadInt8(bs)
-        -- Frontend payload for AutoFill
+        if iid == 25 and not clicker then
+            clicker = true
+        end
+
+        -- Frontend payload for AutoFill: length, encoding flag, JSON/text body.
         local okPayload, payload = pcall(function()
             local len = raknetBitStreamReadInt16(bs)
             local encoded = raknetBitStreamReadInt8(bs)
@@ -1827,13 +2496,301 @@ function onReceivePacket(id, bs)
     elseif p == 62 then
         local iid = raknetBitStreamReadInt8(bs)
         local on = raknetBitStreamReadBool(bs)
+        if iid == 101 then
+            trunk = on and true or false
+        end
         if iid == GAS_INTERFACE_ID and featureOn(autoFill) then
             sendGasInterfaceState(iid, on)
             return false
         end
+
+        if iid == 25 then
+            if on then
+                clicker = true
+            else
+                clicker = false
+                mark()
+            end
+        end
+
+        if iid == 81 and on and featureOn(autoCaptcha) then
+            lua_thread.create(function()
+                wait(60)
+                if not featureOn(autoCaptcha) then return end
+                sendLoaded(81, true)
+                for cell = 0, 24 do
+                    if not featureOn(autoCaptcha) then return end
+                    sendClickIface(81, cell, 0, "")
+                    wait(20)
+                end
+                for i = 1, 8 do
+                    if not featureOn(autoCaptcha) then return end
+                    sendClickIface(81, 0, 0, "")
+                    wait(30)
+                end
+            end)
+        end
     end
 end
 
+local TOOL_ITEMS = {
+    { key = "barrier", name = "Заграждение", code = 0x30, repeatTake = true, count = 4 },
+    { key = "hammer", name = "Молоток", code = 0x31 },
+    { key = "trash", name = "Мусор" },
+    { key = "wrench", name = "Гаечный ключ", code = 0x32 },
+    { key = "asphalt", name = "Асфальт", code = 0x33, repeatTake = true, count = 4 },
+    { key = "roller", name = "Каток", code = 0x34 }
+}
+-- Этапы определяются только по ключевым словам в сообщениях сервера.
+-- Заграждение намеренно отсутствует: сервер не присылает для него сообщение,
+-- поэтому первый этап с заграждением определяется только ручным взятием.
+local TOOL_CHAT_STAGES = {
+    { phrase = "Приступайте к устранению старого асфальта с помощью отбойного молотка.", key = "hammer" },
+    { phrase = "Возьмите дорожный каток из служебного автомобиля и выровняйте все засыпанные дорожные ямы.", key = "roller" },
+    { phrase = "Приступайте к починке труб в образовавшихся ямах.", key = "wrench" },
+    { phrase = "Уберите мусор из дорожных ям и погрузите его в служебный автомобиль.", key = "trash" },
+    { phrase = "Приступайте к засыпанию дорожных ям новым асфальтом.", key = "asphalt" }
+}
+
+local function toolNormalize(s)
+    s = tostring(s or ""):gsub("{%x+}", "")
+    -- Lua 5.1 string.lower не обрабатывает кириллицу.
+    local upperToLower = {
+        ["А"]="а", ["Б"]="б", ["В"]="в", ["Г"]="г", ["Д"]="д",
+        ["Е"]="е", ["Ё"]="ё", ["Ж"]="ж", ["З"]="з", ["И"]="и",
+        ["Й"]="й", ["К"]="к", ["Л"]="л", ["М"]="м", ["Н"]="н",
+        ["О"]="о", ["П"]="п", ["Р"]="р", ["С"]="с", ["Т"]="т",
+        ["У"]="у", ["Ф"]="ф", ["Х"]="х", ["Ц"]="ц", ["Ч"]="ч",
+        ["Ш"]="ш", ["Щ"]="щ", ["Ъ"]="ъ", ["Ы"]="ы", ["Ь"]="ь",
+        ["Э"]="э", ["Ю"]="ю", ["Я"]="я"
+    }
+    for upper, lower in pairs(upperToLower) do s = s:gsub(upper, lower) end
+    s = s:gsub("[\r\n]+", " "):gsub("[%s]+", " ")
+    -- string.gsub возвращает два значения: строку и число замен.
+    -- Возвращаем только строку, иначе последний вызов в table-конструкторе
+    -- добавляет число в normalizedVariants и обработчик чата падает на :find().
+    local normalized = s:lower():gsub("^%s+", "")
+    normalized = normalized:gsub("%s+$", "")
+    return normalized
+end
+
+local function toolFindByKey(key)
+    for i, item in ipairs(TOOL_ITEMS) do if item.key == key then return i end end
+    return nil
+end
+
+local function toolSetStage(index, source)
+    if not index or not TOOL_ITEMS[index] then
+        return
+    end
+    local changed = toolStage ~= index
+    if changed then
+        toolStage = index
+        toolButtonGeneration = toolButtonGeneration + 1
+        toolQueueBusy = false
+        if TOOL_ITEMS[index].key ~= "roller" then
+            toolRollerWaitAt = 0
+        end
+    end
+
+    if not autoTool[0] then return end
+    if changed then
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап определён: {00FF88}" .. TOOL_ITEMS[index].name, -1)
+    end
+
+    -- После повторного включения ждём первое ручное взятие инструмента.
+    -- Дальше этапы берутся из сообщений сервера и очередь запускается автоматически.
+    if source == "chat" and TOOL_ITEMS[index].code and toolStartQueue and not toolNeedsManualTake then
+        toolStartQueue()
+    elseif not TOOL_ITEMS[index].code and (source == "chat" or source == "fist-hit") then
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап «{FFCC55}" .. TOOL_ITEMS[index].name .. "{FFFFFF}» — действие выполняется вручную.", -1)
+    end
+end
+
+local function toolSetEnabled(on)
+    autoTool[0] = on and true or false
+    toolButtonGeneration = toolButtonGeneration + 1
+    toolQueueBusy = false
+    toolTrunkFlag = false
+    toolLastHitAt = 0
+    toolRollerWaitAt = 0
+    if autoTool[0] then
+        toolStage = nil
+        toolNeedsManualTake = true
+        toolRollerWaitAt = 0
+        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Включено. Жду сообщение сервера или ваше первое ручное взятие инструмента.", -1)
+    else
+        toolStage = nil
+        toolNeedsManualTake = true
+        sampAddChatMessage("{FF7777}[ИНСТРУМЕНТ] {FFFFFF}Выключено. Этап сброшен.", -1)
+    end
+    mark()
+    saveCfg()
+end
+
+local function toolPacketFor(item)
+    if not item or not item.code then return nil end
+    return {0x3F, 0x65, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, item.code}
+end
+
+local function toolSendRaw(bytes)
+    if not autoTool[0] or not bytes or not isSampAvailable() then return false end
+    toolIgnoreOutUntil = os.clock() + 0.25
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    for _, b in ipairs(bytes) do raknetBitStreamWriteInt8(bs, b) end
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+    return true
+end
+
+toolStartQueue = function()
+    if not autoTool[0] then return end
+    if toolNeedsManualTake then return end
+    if not toolStage then return end
+    if toolQueueBusy then return end
+    local generation = toolButtonGeneration
+    local item = TOOL_ITEMS[toolStage]
+    if item.key == "roller" then toolRollerWaitAt = os.clock() end
+    local bytes = toolPacketFor(item)
+    if not bytes then
+        sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Этап «" .. item.name .. "» — действие выполняется вручную.", -1)
+        return
+    end
+    toolQueueBusy = true
+    lua_thread.create(function()
+        local count = item.repeatTake and (item.count or 4) or 1
+        for i = 1, count do
+            if not autoTool[0] or generation ~= toolButtonGeneration or toolNeedsManualTake then break end
+            toolSendRaw(bytes)
+            if i < count then
+                wait(toolRepeatDelayMs)
+            end
+        end
+        if autoTool[0] and generation == toolButtonGeneration then
+            wait(40)
+            toolSendRaw({0x9F, 0xFF, 0xFF})
+        end
+        if generation == toolButtonGeneration then
+            toolQueueBusy = false
+        end
+    end)
+end
+
+local function toolProcessOutgoing220(bs)
+    local size = raknetBitStreamGetNumberOfBytesUsed(bs)
+    if size <= 0 then return end
+    raknetBitStreamResetReadPointer(bs)
+    local bytes = {}
+    for i = 1, size do bytes[i] = bit.band(raknetBitStreamReadInt8(bs), 0xFF) end
+    raknetBitStreamResetReadPointer(bs)
+
+    local now = os.clock()
+    local open = (size == 3 and bytes[1] == 0x42 and bytes[2] == 0x65 and bytes[3] == 0x00)
+        or (size == 4 and bytes[1] == 0xDC and bytes[2] == 0x42 and bytes[3] == 0x65 and bytes[4] == 0x00)
+    if open and autoTool[0] and (now - toolLastOpen) > 0.45 then
+        toolLastOpen = now
+        toolRollerWaitAt = 0
+        toolTrunkFlag = true
+    end
+
+    if not autoTool[0] or now < toolIgnoreOutUntil then return end
+    local start = (bytes[1] == 0xDC) and 2 or 1
+    for i = start, size - 12 do
+        if bytes[i] == 0x3F and bytes[i+1] == 0x65 and bytes[i+12] then
+            local code = bytes[i+12]
+            for idx, item in ipairs(TOOL_ITEMS) do
+                if item.code == code then
+                    local wasWaiting = toolNeedsManualTake
+                    toolNeedsManualTake = false
+                    toolSetStage(idx, "manual-pickup")
+                    if item.key == "roller" then
+                        toolRollerWaitAt = os.clock()
+                    end
+                    if wasWaiting then
+                        sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап распознан: {00FF88}" .. item.name .. ". Дальше подбор автоматический.", -1)
+                    end
+                    return
+                end
+            end
+        end
+    end
+end
+
+local function toolAdvanceAfterHit()
+    if not autoTool[0] or toolNeedsManualTake or not toolStage then return end
+    local now = os.clock()
+    if now - toolLastHitAt < 0.45 then return end
+    toolLastHitAt = now
+    local nextStage = toolStage + 1
+    if nextStage > #TOOL_ITEMS then return end
+    toolSetStage(nextStage, "fist-hit")
+    if TOOL_ITEMS[nextStage].code then
+        toolStartQueue()
+    end
+end
+
+function onSendPacket(id, bs)
+    if id == 220 then
+        toolProcessOutgoing220(bs)
+        return
+    end
+end
+
+local function qty(s)
+    local n = tonumber(tostring(s or ""):match("%((%d+)")) or 1
+    if n < 1 then n = 1 end
+    if n > 50 then n = 50 end
+    return n
+end
+
+local function isFrameMsg(s)
+    return string.find(s, "Frame", 1, true) or string.find(s, "frame", 1, true)
+end
+
+local function isStorageMsg(s)
+    return string.find(s, "storage", 1, true)
+        or string.find(s, "Storage", 1, true)
+        or string.find(s, "/storage", 1, true)
+end
+
+local function hasQty(s)
+    return string.find(s, "%(%d+") ~= nil
+end
+
+local function addFrame(n)
+    st.frame = st.frame + n
+    mark()
+    sampAddChatMessage("{00BFFF}[Taxi Helper] Frame +" .. n .. " (" .. st.frame .. ")", -1)
+end
+
+local function addOther(n)
+    st.chests = st.chests + n
+    mark()
+    sampAddChatMessage("{00BFFF}[Taxi Helper] Предмет +" .. n .. " (" .. st.chests .. ")", -1)
+end
+
+-- Только ASCII: storage / Frame / (N — не зависит от CP1251/UTF-8.
+-- Если предмет и /storage приходят разными строками, сохраняем промежуточное состояние до 3 секунд.
+local function drawDigger(dl, x, y, s)
+    local function ln(x1, y1, x2, y2)
+        dl:AddLine(V2(x1, y1), V2(x2, y2), COL, math.max(2.0, s * 0.07))
+    end
+    local cx = x + s * 0.50
+    dl:AddCircleFilled(V2(cx - s * 0.06, y + s * 0.16), s * 0.09, COL, 16)
+    ln(cx - s * 0.08, y + s * 0.26, cx - s * 0.14, y + s * 0.50)
+    ln(cx - s * 0.10, y + s * 0.32, cx - s * 0.28, y + s * 0.42)
+    ln(cx - s * 0.10, y + s * 0.34, cx + s * 0.08, y + s * 0.52)
+    ln(cx - s * 0.14, y + s * 0.50, cx - s * 0.30, y + s * 0.74)
+    ln(cx - s * 0.14, y + s * 0.50, cx + s * 0.02, y + s * 0.74)
+    ln(cx + s * 0.04, y + s * 0.48, cx + s * 0.22, y + s * 0.70)
+    dl:AddTriangleFilled(
+        V2(cx + s * 0.10, y + s * 0.60),
+        V2(cx + s * 0.28, y + s * 0.72),
+        V2(cx + s * 0.12, y + s * 0.82),
+        COL
+    )
+end
 
 -- Встроенные иконки: при первом запуске скрипт сам создаёт папки и PNG-файлы.
 local iconTextures = {}
@@ -2067,52 +3024,424 @@ RH_MENU_SHARED = {
     totalMoney = totalMoney
 }
 
--- Мини-карта Taxi Helper (из предоставленного пользователем скрипта).
-local taxiMapWindow = new.bool(false)
-local taxiMapTexture = nil
-local taxiMapWidth, taxiMapHeight = 1076, 1077
-local taxiWorldMinX, taxiWorldMaxX = -3000, 3000
-local taxiWorldMinY, taxiWorldMaxY = -3000, 3000
-local taxiMapReady = false
-local function initTaxiMapTexture()
-    if taxiMapReady then return end
-    taxiMapReady = true
-    local path = getWorkingDirectory() .. '/resource/map.png'
-    if doesFileExist(path) then
-        local ok, tex = pcall(imgui.CreateTextureFromFile, path)
-        if ok then taxiMapTexture = tex end
+-- Ресурсы и GPS-данные для отдельного окна большой карты.
+local taxiBigMapWindow = new.bool(false)
+local taxiMapTextures = {}
+local taxiMapInfo = {
+    standard = { paths = {'/resource/map.png'}, width = 2048, height = 2048,
+        minX = -3000, maxX = 3000, minY = -3000, maxY = 3000 },
+    -- Исходный файл из репозитория называется vc.png; vc_map.png оставлен как совместимый вариант.
+    -- vc.png — штатная карта репозитория (область -2000..2000);
+    -- vc_map.png оставлен запасным вариантом, т.к. у него может быть иной кроп/масштаб.
+    vc = { paths = {'/resource/vc.png', '/resource/vc_map.png'}, width = 1024, height = 1024 }
+}
+TAXI_GPS = TAXI_GPS or {}
+TAXI_GPS.graphs = TAXI_GPS.graphs or {}
+TAXI_GPS.routeCache = TAXI_GPS.routeCache or { profile = nil, points = nil, at = 0 }
+TAXI_GPS.downloads = TAXI_GPS.downloads or {}
+
+local function taxiResourceDirectories()
+    local dirs = { getWorkingDirectory() .. '/resource/' }
+    local ok, script = pcall(thisScript)
+    if ok and script and script.path then
+        local dir = script.path:match('^(.*[/\\])')
+        if dir then dirs[#dirs + 1] = dir .. 'resource/' end
     end
+    return dirs
+end
+local function taxiMapFilePaths(profile)
+    local found = {}
+    local info = taxiMapInfo[profile]
+    for _, dir in ipairs(taxiResourceDirectories()) do
+        for _, rel in ipairs(info.paths or {}) do
+            local name = rel:gsub('^/resource/', '')
+            local full = dir .. name
+            if doesFileExist(full) then found[#found + 1] = full end
+        end
+    end
+    return found
 end
 
-imgui.OnFrame(function() return taxiMapWindow[0] end, function(self)
+local function taxiTryDownload(url, path, key)
+    if TAXI_GPS.downloads[key] or type(downloadUrlToFile) ~= 'function' then return end
+    TAXI_GPS.downloads[key] = true
+    local ok = pcall(downloadUrlToFile, url, path, function(id, status)
+        TAXI_GPS.downloads[key] = false
+        if status == 200 or status == 0 then
+            printStringNow('Taxi Helper: файл карты/маршрута загружен', 2500)
+        else
+            printStringNow('Taxi Helper: не удалось загрузить файл маршрута', 3000)
+        end
+    end)
+    if not ok then TAXI_GPS.downloads[key] = false end
+end
+
+-- Проверяем PNG до передачи нативному загрузчику текстур.
+-- Повреждённые, слишком большие и нестандартно закодированные файлы не отдаём ImGui:
+-- pcall не способен перехватить аварийное завершение внутри нативного декодера.
+local function taxiValidateMapPng(path)
+    local f = io.open(path, 'rb')
+    if not f then return false, 'файл не открывается' end
+    local header = f:read(33)
+    local size = f:seek('end') or 0
+    f:close()
+    if not header or #header < 33 or header:sub(1, 8) ~= '\137PNG\r\n\26\n' or header:sub(13, 16) ~= 'IHDR' then
+        return false, 'неверный PNG-заголовок'
+    end
+    if size < 64 or size > 12 * 1024 * 1024 then
+        return false, 'неподходящий размер PNG (' .. tostring(size) .. ' байт)'
+    end
+    local function be32(a, b, c, d)
+        return ((a * 256 + b) * 256 + c) * 256 + d
+    end
+    local w = be32(header:byte(17, 20))
+    local h = be32(header:byte(21, 24))
+    local depth, color, compression, filter, interlace = header:byte(25, 29)
+    if not w or not h or w < 64 or h < 64 or w > 4096 or h > 4096 then
+        return false, 'неподходящее разрешение PNG'
+    end
+    -- Поддерживаем распространённые 8-bit RGB/RGBA PNG. Indexed/16-bit PNG
+    -- часто несовместимы с мобильными сборками текстурного загрузчика.
+    if depth ~= 8 or (color ~= 2 and color ~= 6) or compression ~= 0 or filter ~= 0 or interlace ~= 0 then
+        return false, 'нужен PNG RGB/RGBA, 8 bit, без interlace'
+    end
+    return true
+end
+
+local function initTaxiMapTexture(profile)
+    local tex = taxiMapTextures[profile]
+    if tex then return tex end
+    TAXI_GPS.mapLoadState = TAXI_GPS.mapLoadState or {}
+    local state = TAXI_GPS.mapLoadState[profile]
+    if state == 'failed' or state == 'loading' then return nil end
+    local paths = taxiMapFilePaths(profile)
+    if #paths == 0 then
+        if profile == 'vc' then
+            -- Даём асинхронной загрузке время завершиться, затем безопасно возвращаем SA.
+            local now = os.clock()
+            TAXI_GPS.vcMapMissingSince = TAXI_GPS.vcMapMissingSince or now
+            local dirs = taxiResourceDirectories()
+            local target = dirs[1] .. 'vc_map.png'
+            taxiTryDownload('https://raw.githubusercontent.com/XiaoNiaoa/vc_lc/main/maps/vc.png', target, 'vc_map')
+            TAXI_GPS.mapError = 'Файл карты Vice City не найден. Ожидается resource/vc.png или resource/vc_map.png.'
+            if now - TAXI_GPS.vcMapMissingSince > 20 then
+                TAXI_GPS.mapLoadState[profile] = 'failed'
+                taxiMapMode = 'standard'
+                pcall(saveCfg)
+                printStringNow('Taxi Helper: карта VC не найдена, включена стандартная', 3500)
+            end
+        end
+        return nil
+    end
+    if profile == 'vc' then TAXI_GPS.vcMapMissingSince = nil end
+    for _, path in ipairs(paths) do
+        -- Стандартная SA-карта использовалась в предыдущих версиях и может быть
+        -- индексированным PNG. Не применяем к ней VC-фильтр RGB/RGBA 8-bit:
+        -- он ошибочно отклонял существующий map.png. Строгую проверку оставляем
+        -- только для внешней карты Vice City, чтобы снизить риск нативного краша.
+        local valid, reason = true, nil
+        if profile == 'vc' then
+            valid, reason = taxiValidateMapPng(path)
+        end
+        if valid then
+            TAXI_GPS.mapLoadState[profile] = 'loading'
+            local ok, loaded = pcall(imgui.CreateTextureFromFile, path)
+            if ok and loaded then
+                taxiMapTextures[profile] = loaded
+                TAXI_GPS.mapLoadedFrom = path
+                TAXI_GPS.mapError = nil
+                TAXI_GPS.mapLoadState[profile] = 'loaded'
+                return loaded
+            end
+            TAXI_GPS.mapError = tostring(loaded or 'CreateTextureFromFile failed')
+        else
+            TAXI_GPS.mapError = reason
+        end
+    end
+    TAXI_GPS.mapLoadState[profile] = 'failed'
+    if profile == 'vc' then
+        taxiMapMode = 'standard'
+        pcall(saveCfg)
+        printStringNow('Taxi Helper: карта VC не поддерживается, включена стандартная', 3500)
+    end
+    return nil
+end
+
+local function taxiLoadRoadGraph(profile)
+    if TAXI_GPS.graphs[profile] then return TAXI_GPS.graphs[profile] end
+    local graph = { nodes = {}, list = {} }
+    if profile == 'standard' then
+        local path = getWorkingDirectory() .. '/resource/Taxi_Helper_Road_Network.json'
+        if not doesFileExist(path) then return nil end
+        local f = io.open(path, 'r')
+        if not f then return nil end
+        local raw = f:read('*a'); f:close()
+        local ok, data = pcall(decodeJson, raw)
+        if not ok or type(data) ~= 'table' or type(data.nodes) ~= 'table' then return nil end
+        for i, n in ipairs(data.nodes) do
+            local node = { x = tonumber(n[1]), y = tonumber(n[2]), z = tonumber(n[3]) or 0, edges = {} }
+            local links = n[4] or {}
+            for _, to in ipairs(links) do node.edges[#node.edges + 1] = tonumber(to) + 1 end
+            graph.nodes[i] = node
+            graph.list[#graph.list + 1] = i
+        end
+    else
+        local path = getWorkingDirectory() .. '/resource/GPS_VC.dat'
+        if not doesFileExist(path) then
+            taxiTryDownload('https://raw.githubusercontent.com/XiaoNiaoa/vc_lc/main/scriptfiles/GPS_VC.dat', path, 'vc_graph')
+            return nil
+        end
+        local f = io.open(path, 'r')
+        if not f then return nil end
+        local byId = {}
+        for line in f:lines() do
+            local kind, rest = line:match('^(%d+)%s+(.+)$')
+            kind = tonumber(kind)
+            if kind == 0 then
+                local x, y, z, idText = rest:match('^(%S+)%s+(%S+)%s+(%S+)%s+%S+%s+(%S+)')
+                local id = tonumber(idText)
+                if id then
+                    byId[id] = { x = tonumber(x), y = tonumber(y), z = tonumber(z) or 0, edges = {} }
+                end
+            elseif kind == 1 then
+                local fromText, toText = rest:match('^(%S+)%s+(%S+)')
+                local from, to = tonumber(fromText), tonumber(toText)
+                if from and to then
+                    graph.edges = graph.edges or {}
+                    graph.edges[#graph.edges + 1] = { from, to }
+                end
+            end
+        end
+        f:close()
+        for _, edge in ipairs(graph.edges or {}) do
+            local n = byId[edge[1]]
+            if n then n.edges[#n.edges + 1] = edge[2] end
+        end
+        graph.nodes = byId
+        for id in pairs(byId) do graph.list[#graph.list + 1] = id end
+        table.sort(graph.list)
+    end
+    if #graph.list > 0 then TAXI_GPS.graphs[profile] = graph; return graph end
+    return nil
+end
+
+local function taxiNearestRoadNode(graph, x, y)
+    local bestId, bestD = nil, math.huge
+    for _, id in ipairs(graph.list) do
+        local n = graph.nodes[id]
+        local dx, dy = n.x - x, n.y - y
+        local d = dx * dx + dy * dy
+        if d < bestD then bestD, bestId = d, id end
+    end
+    return bestId, math.sqrt(bestD)
+end
+
+local function taxiHeapPush(heap, item)
+    local i = #heap + 1; heap[i] = item
+    while i > 1 do
+        local p = math.floor(i / 2)
+        if heap[p].f <= item.f then break end
+        heap[i] = heap[p]; i = p
+    end
+    heap[i] = item
+end
+local function taxiHeapPop(heap)
+    local root = heap[1]
+    local last = table.remove(heap)
+    if #heap > 0 then
+        local i = 1
+        while true do
+            local l, r = i * 2, i * 2 + 1
+            if l > #heap then break end
+            local c = l
+            if r <= #heap and heap[r].f < heap[l].f then c = r end
+            if heap[c].f >= last.f then break end
+            heap[i] = heap[c]; i = c
+        end
+        heap[i] = last
+    end
+    return root
+end
+
+local function taxiBuildRoadRoute(profile, sx, sy, tx, ty)
+    local graph = taxiLoadRoadGraph(profile)
+    if not graph then return nil end
+    local startId, startDist = taxiNearestRoadNode(graph, sx, sy)
+    local goalId, goalDist = taxiNearestRoadNode(graph, tx, ty)
+    if not startId or not goalId or startDist > 180 or goalDist > 180 then return nil end
+    if startId == goalId then return {{x=sx,y=sy},{x=graph.nodes[startId].x,y=graph.nodes[startId].y},{x=tx,y=ty}} end
+    local open, came, gScore, closed = {}, {}, {[startId]=0}, {}
+    local goal = graph.nodes[goalId]
+    local first = graph.nodes[startId]
+    local function heuristic(id)
+        local n = graph.nodes[id]; local dx, dy = n.x-goal.x, n.y-goal.y
+        return math.sqrt(dx*dx+dy*dy)
+    end
+    taxiHeapPush(open, {id=startId, f=heuristic(startId)})
+    local found, iterations = false, 0
+    while #open > 0 and iterations < 60000 do
+        iterations = iterations + 1
+        local cur = taxiHeapPop(open)
+        local id = cur.id
+        if not closed[id] then
+            if id == goalId then found = true; break end
+            closed[id] = true
+            local n = graph.nodes[id]
+            for _, to in ipairs(n.edges or {}) do
+                local nb = graph.nodes[to]
+                if nb and not closed[to] then
+                    local dx, dy = nb.x-n.x, nb.y-n.y
+                    local tentative = (gScore[id] or math.huge) + math.sqrt(dx*dx+dy*dy)
+                    if tentative < (gScore[to] or math.huge) then
+                        came[to] = id; gScore[to] = tentative
+                        taxiHeapPush(open, {id=to, f=tentative+heuristic(to)})
+                    end
+                end
+            end
+        end
+    end
+    if not found then return nil end
+    local ids, cur = {}, goalId
+    while cur do
+        table.insert(ids, 1, cur)
+        if cur == startId then break end
+        cur = came[cur]
+    end
+    if ids[1] ~= startId then return nil end
+    local points = {{x=sx,y=sy}}
+    for _, id in ipairs(ids) do
+        local n = graph.nodes[id]
+        points[#points + 1] = {x=n.x,y=n.y}
+    end
+    points[#points + 1] = {x=tx,y=ty}
+    return points
+end
+
+local function detectTaxiMapProfile(x, y)
+    if taxiMapMode == 'standard' then return 'standard' end
+    if taxiMapMode == 'vc' then return 'vc' end
+    if x and y and x >= 4000 and x <= 8000 and y >= -950 and y <= 3050 then return 'vc' end
+    return 'standard'
+end
+-- GPS_VC.dat использует координаты SA-MP со смещением +6000/+1050.
+-- При этом некоторые серверные события могут отдавать исходные координаты VC.
+local function taxiNormalizeVCWorldCoords(x, y)
+    if not x or not y then return x, y end
+    if x >= 4000 and x <= 8000 and y >= -950 and y <= 3050 then return x, y end
+    if x >= -2000 and x <= 2000 and y >= -2000 and y <= 2000 then
+        return x + 6000.0, y + 1050.0
+    end
+    return x, y
+end
+
+local function taxiMapPointToScreen(x, y, profile, mapPos, mapSize)
+    if not x or not y then return nil, nil end
+    if profile == 'vc' then
+        x, y = taxiNormalizeVCWorldCoords(x, y)
+    end
+    if profile == 'vc' then
+        -- GPS_VC.dat хранит X/Y в порядке SA-MP: X смещён на +6000, Y на +1050.
+        -- Не переставляем оси: это искажало положение игрока и чекпоинта.
+        local ox, oy = x - 6000.0, y - 1050.0
+        local ix = ((ox + 2000.0) / 4000.0) * mapSize.x
+        local iy = ((2000.0 - oy) / 4000.0) * mapSize.y
+        return mapPos.x + ix, mapPos.y + iy
+    end
+    local info = taxiMapInfo.standard
+    local ix = ((x - info.minX) / (info.maxX - info.minX)) * mapSize.x
+    local iy = ((info.maxY - y) / (info.maxY - info.minY)) * mapSize.y
+    return mapPos.x + ix, mapPos.y + iy
+end
+
+-- Мини-карта удалена. GPS-данные и маршрутизация оставлены для отдельного окна большой карты.
+
+-- Прежняя большая карта Taxi Helper. Отрисовка и автомобильный маркер сохранены
+-- по старому варианту; окно, масштаб и открытие независимы от панели быстрого доступа.
+imgui.OnFrame(function() return taxiBigMapWindow[0] end, function(self)
     self.HideCursor = false
-    initTaxiMapTexture()
+    local ok, px, py = pcall(function() local x, y = getCharCoordinates(PLAYER_PED); return x, y end)
+    local profile = detectTaxiMapProfile(ok and px or nil, ok and py or nil)
+    local taxiMapTexture = initTaxiMapTexture(profile)
+    if profile == 'vc' and not taxiMapTexture and TAXI_GPS.mapLoadState and TAXI_GPS.mapLoadState.vc == 'failed' then
+        profile = 'standard'
+        taxiMapTexture = initTaxiMapTexture(profile)
+    end
+    local info = taxiMapInfo[profile]
     imgui.SetNextWindowSize(V2(math.min(sizeX * 0.92, 850 * S), math.min(sizeY * 0.82, 620 * S)), imgui.Cond.FirstUseEver)
-    imgui.Begin(u8'Карта такси', taxiMapWindow)
+    imgui.Begin(u8'Карта такси | Большая', taxiBigMapWindow)
+    local modeLabel = taxiMapMode == 'auto' and 'АВТОМАТИЧЕСКИ' or (taxiMapMode == 'vc' and 'VICE CITY' or 'СТАНДАРТНАЯ')
+    imgui.Text(u8('Карта: ' .. modeLabel .. (taxiMapMode == 'auto' and (profile == 'vc' and ' (Vice City)' or ' (San Andreas)') or '')))
+    if not TAXI_GPS.routeCache.points and not taxiLoadRoadGraph(profile) then imgui.TextWrapped(u8(profile == 'vc' and 'Загружается дорожная сеть Vice City...' or 'Нет файла дорожной сети San Andreas в resource.')) end
     imgui.Text(u8'Масштаб карты')
-    if imgui.SliderFloat('##taxi_map_zoom', taxiMapZoom, 0.50, 2.00, '%.2fx') then
-        saveCfg()
+    if imgui.SliderFloat('##taxi_big_map_zoom', taxiBigMapZoom, 0.50, 2.00, '%.2fx') then saveCfg() end
+    if profile == 'vc' and ok and px and py then
+        local nx, ny = taxiNormalizeVCWorldCoords(px, py)
+        local graph = taxiLoadRoadGraph('vc')
+        local nearestText = 'сеть не загружена'
+        if graph then
+            local nearestId, nearestDist = taxiNearestRoadNode(graph, nx, ny)
+            if nearestId then
+                local node = graph.nodes[nearestId]
+                nearestText = string.format('узел #%s: %.1f м (%.1f, %.1f)', tostring(nearestId), nearestDist, node.x, node.y)
+            else
+                nearestText = 'в сети нет узлов'
+            end
+        end
+        imgui.TextWrapped(u8(string.format('VC DEBUG | игрок: %.1f, %.1f | норм.: %.1f, %.1f', px, py, nx or px, ny or py)))
+        imgui.TextWrapped(u8('Ближайшая дорога: ' .. nearestText))
+        imgui.TextWrapped(u8('Карта загружена: ' .. tostring(TAXI_GPS.mapLoadedFrom or 'путь не определён')))
     end
     if taxiMapTexture then
         local avail = imgui.GetContentRegionAvail()
-        local scale = math.min(avail.x / taxiMapWidth, (avail.y - 8 * S) / taxiMapHeight)
-        scale = math.max(0.1, scale) * taxiMapZoom[0]
-        local mapSize = V2(taxiMapWidth * scale, taxiMapHeight * scale)
+        local scale = math.min(avail.x / info.width, (avail.y - 8 * S) / info.height)
+        scale = math.max(0.1, scale) * taxiBigMapZoom[0]
+        local mapSize = V2(info.width * scale, info.height * scale)
         local mapPos = imgui.GetCursorScreenPos()
         local dl = imgui.GetWindowDrawList()
         imgui.Image(taxiMapTexture, mapSize)
-        local ok, px, py = pcall(function() local x,y = getCharCoordinates(PLAYER_PED); return x,y end)
-        if ok and px and py then
-            local ix = ((px - taxiWorldMinX) / (taxiWorldMaxX - taxiWorldMinX)) * mapSize.x
-            local iy = ((taxiWorldMaxY - py) / (taxiWorldMaxY - taxiWorldMinY)) * mapSize.y
-            -- Игрок: компактная пиктограмма такси (жёлтый кузов, шашечки и колёса).
-            local cx, cy = mapPos.x + ix, mapPos.y + iy
+        local playerScreenX, playerScreenY = nil, nil
+        if ok and px and py then playerScreenX, playerScreenY = taxiMapPointToScreen(px, py, profile, mapPos, mapSize) end
+        local targetScreenX, targetScreenY = nil, nil
+        if taxiMarkerX and taxiMarkerY then targetScreenX, targetScreenY = taxiMapPointToScreen(taxiMarkerX, taxiMarkerY, profile, mapPos, mapSize) end
+        if ok and px and py and taxiMarkerX and taxiMarkerY then
+            local routePX, routePY, routeTX, routeTY = px, py, taxiMarkerX, taxiMarkerY
+            if profile == 'vc' then
+                routePX, routePY = taxiNormalizeVCWorldCoords(routePX, routePY)
+                routeTX, routeTY = taxiNormalizeVCWorldCoords(routeTX, routeTY)
+            end
+            local cache = TAXI_GPS.routeCache
+            local now = os.clock()
+            local stale = not cache.checked or cache.profile ~= profile or not cache.sx or
+                math.abs(cache.sx-routePX) + math.abs(cache.sy-routePY) > 25 or
+                math.abs(cache.tx-routeTX) + math.abs(cache.ty-routeTY) > 10 or now-cache.at > 2.0
+            if stale then
+                cache.profile, cache.sx, cache.sy = profile, routePX, routePY
+                cache.tx, cache.ty, cache.at, cache.checked = routeTX, routeTY, now, true
+                cache.points = taxiBuildRoadRoute(profile, routePX, routePY, routeTX, routeTY)
+            end
+            if cache.points and #cache.points >= 2 then
+                local screenPoints = {}
+                for i, point in ipairs(cache.points) do
+                    local x, y = taxiMapPointToScreen(point.x, point.y, profile, mapPos, mapSize)
+                    if x and y then screenPoints[i] = V2(x, y) end
+                end
+                for i = 1, #screenPoints - 1 do
+                    if screenPoints[i] and screenPoints[i+1] then
+                        dl:AddLine(screenPoints[i], screenPoints[i+1], 0xD0000000, 5.25 * S)
+                        dl:AddLine(screenPoints[i], screenPoints[i+1], 0xFFFFD000, 3 * S)
+                    end
+                end
+            end
+        end
+        -- Старый значок игрока (автомобиль) оставлен без изменений.
+        if playerScreenX and playerScreenY then
+            local cx, cy = playerScreenX, playerScreenY
             local w, h = 15 * S, 9 * S
-            dl:AddRectFilled(imgui.ImVec2(cx - w * 0.5, cy - h * 0.15), imgui.ImVec2(cx + w * 0.5, cy + h * 0.48), 0xFF20BFFF, 2 * S)
-            dl:AddRectFilled(imgui.ImVec2(cx - w * 0.28, cy - h * 0.62), imgui.ImVec2(cx + w * 0.24, cy - h * 0.08), 0xFFFFE8B0, 2 * S)
-            dl:AddRectFilled(imgui.ImVec2(cx - w * 0.12, cy - h * 0.05), imgui.ImVec2(cx + w * 0.12, cy + h * 0.16), 0xFF202020, 1 * S)
-            dl:AddCircleFilled(imgui.ImVec2(cx - w * 0.28, cy + h * 0.48), 2.2 * S, 0xFF101010, 12)
-            dl:AddCircleFilled(imgui.ImVec2(cx + w * 0.28, cy + h * 0.48), 2.2 * S, 0xFF101010, 12)
+            dl:AddRectFilled(V2(cx - w * 0.5, cy - h * 0.15), V2(cx + w * 0.5, cy + h * 0.48), 0xFF20BFFF, 2 * S)
+            dl:AddRectFilled(V2(cx - w * 0.28, cy - h * 0.62), V2(cx + w * 0.24, cy - h * 0.08), 0xFFFFE8B0, 2 * S)
+            dl:AddRectFilled(V2(cx - w * 0.12, cy - h * 0.05), V2(cx + w * 0.12, cy + h * 0.16), 0xFF202020, 1 * S)
+            dl:AddCircleFilled(V2(cx - w * 0.28, cy + h * 0.48), 2.2 * S, 0xFF101010, 12)
+            dl:AddCircleFilled(V2(cx + w * 0.28, cy + h * 0.48), 2.2 * S, 0xFF101010, 12)
         end
         local status, wx, wy = false, nil, nil
         if type(getTargetBlipCoordinates) == 'function' then
@@ -2120,24 +3449,29 @@ imgui.OnFrame(function() return taxiMapWindow[0] end, function(self)
             if okBlip then status, wx, wy = a, b, c end
         end
         if status then
-            local ix = ((wx - taxiWorldMinX) / (taxiWorldMaxX - taxiWorldMinX)) * mapSize.x
-            local iy = ((taxiWorldMaxY - wy) / (taxiWorldMaxY - taxiWorldMinY)) * mapSize.y
-            dl:AddCircleFilled(imgui.ImVec2(mapPos.x + ix, mapPos.y + iy), 8 * S, 0xFF00A5FF, 32)
+            local bx, by = taxiMapPointToScreen(wx, wy, profile, mapPos, mapSize)
+            if bx and by then dl:AddCircleFilled(V2(bx, by), 8 * S, 0xFF00A5FF, 32) end
         end
-        if taxiMarkerX and taxiMarkerY then
-            local ix = ((taxiMarkerX - taxiWorldMinX) / (taxiWorldMaxX - taxiWorldMinX)) * mapSize.x
-            local iy = ((taxiWorldMaxY - taxiMarkerY) / (taxiWorldMaxY - taxiWorldMinY)) * mapSize.y
-            -- Точка назначения: красная пиктограмма человека.
-            local cx, cy = mapPos.x + ix, mapPos.y + iy
-            dl:AddCircleFilled(imgui.ImVec2(cx, cy - 5 * S), 3.2 * S, 0xFF3030E8, 16)
-            dl:AddLine(imgui.ImVec2(cx, cy - 1 * S), imgui.ImVec2(cx, cy + 5 * S), 0xFF3030E8, 3 * S)
-            dl:AddLine(imgui.ImVec2(cx, cy + 1 * S), imgui.ImVec2(cx - 4 * S, cy + 5 * S), 0xFF3030E8, 2.5 * S)
-            dl:AddLine(imgui.ImVec2(cx, cy + 1 * S), imgui.ImVec2(cx + 4 * S, cy + 5 * S), 0xFF3030E8, 2.5 * S)
-            dl:AddLine(imgui.ImVec2(cx, cy + 5 * S), imgui.ImVec2(cx - 3 * S, cy + 10 * S), 0xFF3030E8, 2.5 * S)
-            dl:AddLine(imgui.ImVec2(cx, cy + 5 * S), imgui.ImVec2(cx + 3 * S, cy + 10 * S), 0xFF3030E8, 2.5 * S)
+        if targetScreenX and targetScreenY then
+            local cx, cy = targetScreenX, targetScreenY
+            dl:AddCircleFilled(V2(cx, cy - 5 * S), 3.2 * S, 0xFF3030E8, 16)
+            dl:AddLine(V2(cx, cy - 1 * S), V2(cx, cy + 5 * S), 0xFF3030E8, 3 * S)
+            dl:AddLine(V2(cx, cy + 1 * S), V2(cx - 4 * S, cy + 5 * S), 0xFF3030E8, 2.5 * S)
+            dl:AddLine(V2(cx, cy + 1 * S), V2(cx + 4 * S, cy + 5 * S), 0xFF3030E8, 2.5 * S)
+            dl:AddLine(V2(cx, cy + 5 * S), V2(cx - 3 * S, cy + 10 * S), 0xFF3030E8, 2.5 * S)
+            dl:AddLine(V2(cx, cy + 5 * S), V2(cx + 3 * S, cy + 10 * S), 0xFF3030E8, 2.5 * S)
         end
     else
-        imgui.TextWrapped(u8'Не найдена карта: resource/map.png. Помести map.png в папку resource рядом со скриптом.')
+        if profile == 'vc' then
+            imgui.TextWrapped(u8'Карта Vice City не прошла проверку или ещё загружается. Используется стандартная карта. Нужен PNG RGB/RGBA 8 bit, без interlace, размером до 4096x4096.')
+            if TAXI_GPS.mapError then imgui.TextWrapped(u8('Ошибка загрузки: ' .. tostring(TAXI_GPS.mapError))) end
+        else
+            if TAXI_GPS.mapLoadState and TAXI_GPS.mapLoadState.standard == 'failed' then
+                imgui.TextWrapped(u8('Файл resource/map.png найден, но не удалось загрузить текстуру: ' .. tostring(TAXI_GPS.mapError or 'неизвестная ошибка')))
+            else
+                imgui.TextWrapped(u8'Не найдена карта: resource/map.png. Проверь папку resource рядом со скриптом или в папке NeomLoader.')
+            end
+        end
     end
     imgui.End()
 end)
@@ -2220,7 +3554,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
     imgui.Dummy(V2(1, 5 * RH_MENU_SHARED.S))
 
     imgui.SetWindowFontScale(0.82)
-    local sideText = RH_MENU_SHARED.u8("Taxi Helper v1.0")
+    local sideText = RH_MENU_SHARED.u8("Taxi Helper v2.2")
     local sideTextW = imgui.CalcTextSize(sideText).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - sideTextW) * 0.5)
     imgui.TextDisabled(sideText)
@@ -2233,6 +3567,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         {RH_MENU_SHARED.u8("ГЛАВНАЯ"), 1, "home"},
         {RH_MENU_SHARED.u8("ФУНКЦИИ"), 2, "settings"},
         {RH_MENU_SHARED.u8("СТАТИСТИКА"), 3, "statistics"},
+        {RH_MENU_SHARED.u8("КАРТА"), 6, "map"},
         {RH_MENU_SHARED.u8("НАСТРОЙКИ"), 4, "buttons"},
         {RH_MENU_SHARED.u8("АВТОР"), 5, "author"}
     }
@@ -2256,17 +3591,33 @@ imgui.OnFrame(function() return ui.open end, function(self)
         else
             clicked = imgui.Button(tab[1], V2(-1, 42 * RH_MENU_SHARED.S))
         end
-        local iconTexture = iconTextures[tab[3]]
-        if iconTexture then
-            local pMin = imgui.GetItemRectMin()
-            local pMax = imgui.GetItemRectMax()
-            local iconSize = 26 * RH_MENU_SHARED.S
-            local iconOffset = tab[3] == "statistics" and -3 * RH_MENU_SHARED.S or (tab[3] == "buttons" and 5 * RH_MENU_SHARED.S or 9 * RH_MENU_SHARED.S)
-            local iconX = pMin.x + iconOffset
-            local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5
+        local pMin = imgui.GetItemRectMin()
+        local pMax = imgui.GetItemRectMax()
+        if tab[3] == "map" then
+            -- GPS / навигационная метка слева от пункта КАРТА.
+            local dl = imgui.GetWindowDrawList()
+            local sc = RH_MENU_SHARED.S
+            local cx = pMin.x + 22 * sc
+            local cy = (pMin.y + pMax.y) * 0.5
             pcall(function()
-                imgui.GetWindowDrawList():AddImage(iconTexture, V2(iconX, iconY), V2(iconX + iconSize, iconY + iconSize))
+                dl:AddCircle(V2(cx, cy), 8.5 * sc, 0xFF65D8FF, 24, 2.0 * sc)
+                dl:AddCircleFilled(V2(cx, cy), 3.0 * sc, 0xFF65D8FF, 16)
+                dl:AddLine(V2(cx - 13 * sc, cy), V2(cx - 9 * sc, cy), 0xFF65D8FF, 1.5 * sc)
+                dl:AddLine(V2(cx + 9 * sc, cy), V2(cx + 13 * sc, cy), 0xFF65D8FF, 1.5 * sc)
+                dl:AddLine(V2(cx, cy - 13 * sc), V2(cx, cy - 9 * sc), 0xFF65D8FF, 1.5 * sc)
+                dl:AddLine(V2(cx, cy + 9 * sc), V2(cx, cy + 13 * sc), 0xFF65D8FF, 1.5 * sc)
             end)
+        else
+            local iconTexture = iconTextures[tab[3]]
+            if iconTexture then
+                local iconSize = 26 * RH_MENU_SHARED.S
+                local iconOffset = tab[3] == "statistics" and -3 * RH_MENU_SHARED.S or (tab[3] == "buttons" and 5 * RH_MENU_SHARED.S or 9 * RH_MENU_SHARED.S)
+                local iconX = pMin.x + iconOffset
+                local iconY = pMin.y + (pMax.y - pMin.y - iconSize) * 0.5
+                pcall(function()
+                    imgui.GetWindowDrawList():AddImage(iconTexture, V2(iconX, iconY), V2(iconX + iconSize, iconY + iconSize))
+                end)
+            end
         end
         if clicked then ui.tab = tab[2] end
         if selected then imgui.PopStyleColor(2) end
@@ -2312,7 +3663,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
         RH_MENU_SHARED.u8("ИГРОВЫЕ ФУНКЦИИ"),
         RH_MENU_SHARED.u8("СТАТИСТИКА РАБОТЫ"),
         RH_MENU_SHARED.u8("НАСТРОЙКИ ПРИЛОЖЕНИЯ"),
-        RH_MENU_SHARED.u8("ИНФОРМАЦИЯ О ПРОЕКТЕ")
+        RH_MENU_SHARED.u8("ИНФОРМАЦИЯ О ПРОЕКТЕ"),
+        RH_MENU_SHARED.u8("НАСТРОЙКИ БОЛЬШОЙ КАРТЫ")
     }
     imgui.SetWindowFontScale(1.12)
     imgui.TextColored(RH_themeColor(palette.accent), headers[ui.tab] or RH_MENU_SHARED.u8("ROAD HELPER"))
@@ -2391,7 +3743,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.TextDisabled(RH_MENU_SHARED.u8("Заработано за сессию: ") .. fmtMoney(st.money))
         imgui.Spacing()
         if imgui.Button(RH_MENU_SHARED.u8("СБРОСИТЬ СТАТИСТИКУ СЕССИИ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
-            if type(TAXI_RESET_SESSION) == "function" then TAXI_RESET_SESSION() else resetTaxiSessionStats() end
+            if TAXI_RESET_STATS then TAXI_RESET_STATS() end
         end
 
     elseif ui.tab == 2 then
@@ -2400,8 +3752,8 @@ imgui.OnFrame(function() return ui.open end, function(self)
 
         local functionsList = {
             { short = "ЗАКАЗ", title = "АВТОЛОВЛЯ БЛИЖАЙШЕГО ЗАКАЗА", card = "Собирает доступные вызовы и выбирает заказ с минимальной дистанцией.", desc = "Получает список заказов из сетевых данных, сортирует кандидатов по расстоянию и выбирает ближайший.", flag = taxiCatch, id = "taxi_catch" },
-            { short = "FREE", title = "РЕЖИМ ЛОВЛИ FREE", card = "Плавный режим: перед принятием заказа используется небольшая случайная задержка.", desc = "FREE сохраняет человеческую паузу перед отправкой подтверждения заказа. В исходной логике задержка выбирается случайно в диапазоне 20–45 мс. Подбор ближайшего заказа и проверка доступных вызовов остаются такими же, как в TURBO.", action = "free" },
-            { short = "TURBO", title = "РЕЖИМ ЛОВЛИ TURBO", card = "Быстрый режим: подтверждение заказа отправляется без задержки — 0 мс.", desc = "TURBO убирает паузу перед подтверждением заказа и отправляет ответ сразу при появлении подходящего диалога. Поиск ближайшего заказа и остальные проверки не меняются; отличается именно задержка подтверждения.", action = "turbo" },
+            { short = "SAFE", title = "РЕЖИМ ЛОВЛИ SAFE", card = "Плавный режим: перед принятием заказа используется небольшая случайная задержка.", desc = "SAFE использует полный текущий интервал сбора списка, анализирует доступные вызовы, выбирает ближайшего клиента и принимает заказ с небольшой случайной задержкой 20–45 мс. Это рекомендуемый сбалансированный режим.", action = "safe" },
+            { short = "TURBO", title = "РЕЖИМ ЛОВЛИ TURBO", card = "Ускоренный анализ списка, быстрый выбор клиента и принятие заказа без задержки.", desc = "TURBO быстрее собирает и анализирует список заказов, чаще проверяет новые данные и быстрее повторяет попытку принятия. Подтверждение отправляется без задержки.", action = "turbo" },
             { short = "ТОПЛИВО", title = "АВТОЗАПРАВКА", card = "Определяет недостающее топливо и запрашивает дозаправку.", desc = "Определяет доступный тип топлива и объём дозаправки.", flag = autoFill, id = "auto_fill", onChanged = function() autoFillGeneration = autoFillGeneration + 1 end },
             { short = "ФЛИП", title = "АВТОФЛИП АВТОМОБИЛЯ", card = "Автоматически переворачивает автомобиль, если он оказался на крыше.", desc = "Отслеживает положение автомобиля и выполняет команду переворота с заданной задержкой. Можно включать и выключать отдельно.", flag = autoFlip, id = "auto_flip" },
             { short = "ЛОК", title = "АВТОЗАКРЫТИЕ АВТОМОБИЛЯ", card = "Автоматически закрывает двери автомобиля после посадки.", desc = "Проверяет состояние замков и при необходимости отправляет команду /lock. Можно включать и выключать отдельно.", flag = autoLock, id = "auto_lock" },
@@ -2415,7 +3767,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
                 imgui.SameLine(0, functionCardGap)
             end
             local chosen = (ui.functionIndex == i) or
-                (item.action == "free" and not TAXI_GET_TURBO()) or
+                (item.action == "safe" and not TAXI_GET_TURBO()) or
                 (item.action == "turbo" and TAXI_GET_TURBO())
             if chosen then
                 imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
@@ -2424,15 +3776,15 @@ imgui.OnFrame(function() return ui.open end, function(self)
                 imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.card))
             end
             imgui.BeginChild("##function_pick_" .. i, V2(functionCardW, functionCardH), true)
-            imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8(item.short))
+            imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8(item.action == "safe" and "SAFE • РЕКОМЕНДУЕТСЯ" or item.short))
             imgui.Separator()
             imgui.TextWrapped(RH_MENU_SHARED.u8(item.card))
             imgui.Spacing()
             imgui.TextDisabled(RH_MENU_SHARED.u8(item.title))
             imgui.Spacing()
             imgui.SetCursorPosY(166 * RH_MENU_SHARED.S)
-            if item.action == "free" then
-                if imgui.Button(RH_MENU_SHARED.u8(not TAXI_GET_TURBO() and "ВЫБРАНО" or "ВЫБРАТЬ FREE"), V2(-1, 38 * RH_MENU_SHARED.S)) then
+            if item.action == "safe" then
+                if imgui.Button(RH_MENU_SHARED.u8(not TAXI_GET_TURBO() and "ВЫБРАНО" or "ВЫБРАТЬ SAFE"), V2(-1, 38 * RH_MENU_SHARED.S)) then
                     TAXI_SET_TURBO(false)
                     ui.functionIndex = i
                 end
@@ -2564,27 +3916,25 @@ imgui.OnFrame(function() return ui.open end, function(self)
             imgui.PopStyleColor()
         end
 
-        buttonSettingsCard("map", "КНОПКА МИНИ-КАРТА", "Показывать отдельную плавающую кнопку открытия карты.", showMapButton, "show_map_button")
-        if showMapButton[0] then
+        buttonSettingsCard("big_map_button", "ОТДЕЛЬНАЯ КНОПКА КАРТА", "Независимое положение и размер кнопки открытия большой карты.", showBigMapButton, "show_big_map_button")
+        if showBigMapButton[0] then
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
-            imgui.BeginChild("##button_map_values", V2(-1, 210 * RH_MENU_SHARED.S), true)
+            imgui.BeginChild("##big_map_button_values", V2(-1, 190 * RH_MENU_SHARED.S), true)
             imgui.Text(RH_MENU_SHARED.u8("Положение X"))
-            if imgui.SliderInt("##mapx", mapBtnX, 0, math.max(0, RH_MENU_SHARED.sizeX - mapBtnW[0])) then mark() end
+            if imgui.SliderInt("##bmpx", bigMapBtnX, 0, math.max(0, RH_MENU_SHARED.sizeX - bigMapBtnW[0])) then mark() end
             imgui.Text(RH_MENU_SHARED.u8("Положение Y"))
-            if imgui.SliderInt("##mapy", mapBtnY, 0, math.max(0, RH_MENU_SHARED.sizeY - mapBtnH[0])) then mark() end
-            imgui.Text(RH_MENU_SHARED.u8("Ширина кнопки"))
-            if imgui.SliderInt("##mapw", mapBtnW, 90, 320) then mark() end
-            imgui.Text(RH_MENU_SHARED.u8("Высота кнопки"))
-            if imgui.SliderInt("##maph", mapBtnH, 32, 90) then mark() end
-            imgui.Text(RH_MENU_SHARED.u8("Масштаб карты"))
-            if imgui.SliderFloat("##mapzoomsettings", taxiMapZoom, 0.50, 2.00, "%.2fx") then mark() end
+            if imgui.SliderInt("##bmpy", bigMapBtnY, 0, math.max(0, RH_MENU_SHARED.sizeY - bigMapBtnH[0])) then mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Ширина кнопки КАРТА"))
+            if imgui.SliderInt("##bmpw", bigMapBtnW, 90, 320) then bigMapBtnX[0] = math.max(0, math.min(sizeX - bigMapBtnW[0], bigMapBtnX[0])); mark() end
+            imgui.Text(RH_MENU_SHARED.u8("Высота кнопки КАРТА"))
+            if imgui.SliderInt("##bmph", bigMapBtnH, 32, 100) then bigMapBtnY[0] = math.max(0, math.min(sizeY - bigMapBtnH[0], bigMapBtnY[0])); mark() end
             imgui.EndChild()
             imgui.PopStyleColor()
         end
 
         imgui.Spacing()
         imgui.Spacing()
-        imgui.TextDisabled(RH_MENU_SHARED.u8("Зажми плавающую кнопку на 0.4 сек. и перетащи пальцем."))
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Удерживай кнопку КАРТА или любую кнопку панели 0.4 сек. для перемещения соответствующего элемента."))
         if imgui.Button(RH_MENU_SHARED.u8("СОХРАНИТЬ ПОЛОЖЕНИЕ КНОПОК"), V2(-1, 40 * RH_MENU_SHARED.S)) then
             saveCfg()
             sampAddChatMessage("{00BFFF}[Taxi Helper] Кнопки сохранены", -1)
@@ -2604,6 +3954,14 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.Text(RH_MENU_SHARED.u8("Заработано за сессию:  ") .. fmtMoney(st.money))
         imgui.Text(RH_MENU_SHARED.u8("Тариф за км:  ") .. tostring(TAXI_STATS.farePerKm or "—"))
         imgui.Spacing()
+        local statsToggleLabel = showStats[0]
+            and RH_MENU_SHARED.u8("СКРЫТЬ МАЛЕНЬКОЕ ОКНО СТАТИСТИКИ")
+            or RH_MENU_SHARED.u8("ПОКАЗАТЬ МАЛЕНЬКОЕ ОКНО СТАТИСТИКИ")
+        if imgui.Button(statsToggleLabel, V2(-1, 38 * RH_MENU_SHARED.S)) then
+            showStats[0] = not showStats[0]
+            mark()
+        end
+        imgui.Spacing()
         if showStats[0] then
             imgui.PushStyleColor(imgui.Col.ChildBg, RH_themeColor(palette.cardInner))
             imgui.BeginChild("##stat_dimensions", V2(-1, 86 * RH_MENU_SHARED.S), true)
@@ -2615,7 +3973,7 @@ imgui.OnFrame(function() return ui.open end, function(self)
             imgui.PopStyleColor()
         end
         if imgui.Button(RH_MENU_SHARED.u8("СБРОСИТЬ СТАТИСТИКУ СЕССИИ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
-            if type(TAXI_RESET_SESSION) == "function" then TAXI_RESET_SESSION() else resetTaxiSessionStats() end
+            if TAXI_RESET_STATS then TAXI_RESET_STATS() end
         end
 
     elseif ui.tab == 5 then
@@ -2634,34 +3992,22 @@ imgui.OnFrame(function() return ui.open end, function(self)
         imgui.TextWrapped(RH_MENU_SHARED.u8("Об обнаруженных багах и недоработках сообщайте на Arizona Mods или в Telegram-канале."))
         imgui.Spacing()
         imgui.TextWrapped(RH_MENU_SHARED.u8("Спасибо всем пользователям за поддержку и обратную связь!"))
+
+    elseif ui.tab == 6 then
+        imgui.TextDisabled(RH_MENU_SHARED.u8("ОТДЕЛЬНОЕ ОКНО БОЛЬШОЙ КАРТЫ"))
         imgui.Spacing()
-        imgui.PushStyleColor(imgui.Col.Button, V4(0.08, 0.40, 0.82, 1.00))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.12, 0.52, 0.98, 1.00))
-        imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.05, 0.30, 0.68, 1.00))
-        if imgui.Button(RH_MENU_SHARED.u8("TG BOWS SCRIPTS"), V2(-1, 44 * RH_MENU_SHARED.S)) then
-            local url = "https://t.me/bowsscripts"
-            local opened = false
-            if type(openLink) == "function" then
-                local ok, result = pcall(openLink, url)
-                opened = ok and result ~= false
-            end
-            if not opened and type(openUrl) == "function" then
-                local ok, result = pcall(openUrl, url)
-                opened = ok and result ~= false
-            end
-            if not opened then
-                -- Android/NeomLoader: открыть Telegram-ссылку через системный Intent.
-                local ok = pcall(os.execute, 'am start -a android.intent.action.VIEW -d "' .. url .. '" >/dev/null 2>&1')
-                opened = ok
-            end
-            if not opened then
-                local copied = false
-                if type(setClipboardText) == "function" then copied = pcall(setClipboardText, url) end
-                if not copied and imgui.SetClipboardText then copied = pcall(imgui.SetClipboardText, url) end
-                notify(copied and L'Ссылка Telegram скопирована' or L'Не удалось открыть Telegram', copied and 0x00CCB3 or 0xFF4757)
-            end
+        if imgui.Button(RH_MENU_SHARED.u8(taxiBigMapWindow[0] and "ЗАКРЫТЬ БОЛЬШУЮ КАРТУ" or "ОТКРЫТЬ БОЛЬШУЮ КАРТУ"), V2(-1, 42 * RH_MENU_SHARED.S)) then
+            taxiBigMapWindow[0] = not taxiBigMapWindow[0]
         end
-        imgui.PopStyleColor(3)
+        imgui.Spacing()
+        imgui.TextColored(RH_themeColor(palette.accent), RH_MENU_SHARED.u8("МАСШТАБ БОЛЬШОЙ КАРТЫ"))
+        if imgui.SliderFloat("##taxi_big_map_zoom_menu", taxiBigMapZoom, 0.50, 2.00, "%.2fx") then mark() end
+        imgui.TextDisabled(RH_MENU_SHARED.u8("Мини-карта и её настройки удалены. Большая карта открывается отдельно."))
+        imgui.Spacing()
+        if imgui.Button(RH_MENU_SHARED.u8("СОХРАНИТЬ НАСТРОЙКИ КАРТЫ"), V2(-1, 40 * RH_MENU_SHARED.S)) then
+            saveCfg()
+            sampAddChatMessage("{00BFFF}[Taxi Helper] Настройки большой карты сохранены", -1)
+        end
     end
 
     imgui.EndChild()
@@ -2810,73 +4156,201 @@ imgui.OnFrame(function() return showCtrl[0] end, function(self)
     imgui.PopStyleVar(5)
 end)
 
--- Отдельная плавающая кнопка МИНИ-КАРТА: расположение и перетаскивание как у СТАРТ/СТОП.
-imgui.OnFrame(function() return showMapButton[0] end, function(self)
+-- Независимая плавающая кнопка КАРТА: отдельные координаты, ширина, высота и перетаскивание.
+imgui.OnFrame(function() return showBigMapButton[0] end, function(self)
     self.HideCursor = false
-    local W, H = mapBtnW[0], mapBtnH[0]
+    local x, y, w, h = bigMapBtnX[0], bigMapBtnY[0], bigMapBtnW[0], bigMapBtnH[0]
     local io = imgui.GetIO()
-    if mapBtnDrag then
+    if bigMapBtnDrag then
         if imgui.IsMouseDown(0) then
-            mapBtnX[0] = math.floor(io.MousePos.x - mapBtnOx)
-            mapBtnY[0] = math.floor(io.MousePos.y - mapBtnOy)
-            mapBtnX[0] = math.max(0, math.min(sizeX - W, mapBtnX[0]))
-            mapBtnY[0] = math.max(0, math.min(sizeY - H, mapBtnY[0]))
+            bigMapBtnX[0] = math.max(0, math.min(sizeX - w, math.floor(io.MousePos.x - bigMapBtnOx)))
+            bigMapBtnY[0] = math.max(0, math.min(sizeY - h, math.floor(io.MousePos.y - bigMapBtnOy)))
         else
-            mapBtnDrag = false
-            mapBtnHold = 0
-            mapBtnSuppressClick = true
-            mark()
-            saveCfg()
+            bigMapBtnDrag = false
+            bigMapBtnHold = 0
+            bigMapBtnSuppressClick = true
+            mark(); saveCfg()
         end
     end
-    imgui.SetNextWindowPos(V2(mapBtnX[0], mapBtnY[0]), imgui.Cond.Always)
-    imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, H / 2)
-    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, H / 2 - 2)
+    imgui.SetNextWindowPos(V2(bigMapBtnX[0], bigMapBtnY[0]), imgui.Cond.Always)
+    imgui.SetNextWindowSize(V2(w, h), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 9 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1 * S)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(4 * S, 3 * S))
+    imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(2 * S, 1 * S))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.025, 0.055, 0.085, 0.97))
+    imgui.PushStyleColor(imgui.Col.Border, V4(0.10, 0.55, 0.78, 0.95))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.055, 0.14, 0.21, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.08, 0.30, 0.43, 1.0))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.88, 0.96, 1.00, 1.0))
+    imgui.Begin("##taxi_big_map_shortcut", nil, imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoSavedSettings)
+    local clicked = imgui.Button(u8"КАРТА", V2(-1, -1))
+    if clicked and not bigMapBtnSuppressClick then taxiBigMapWindow[0] = not taxiBigMapWindow[0] end
+    local active = imgui.IsItemActive()
+    if active and not bigMapBtnDrag then
+        bigMapBtnHold = bigMapBtnHold + io.DeltaTime
+        if bigMapBtnHold >= HOLD then
+            bigMapBtnDrag = true
+            bigMapBtnSuppressClick = true
+            bigMapBtnOx = io.MousePos.x - bigMapBtnX[0]
+            bigMapBtnOy = io.MousePos.y - bigMapBtnY[0]
+        end
+    elseif not active and not bigMapBtnDrag then
+        bigMapBtnHold = 0
+    end
+    if bigMapBtnSuppressClick and not active and not bigMapBtnDrag then bigMapBtnSuppressClick = false end
+    imgui.End()
+    imgui.PopStyleColor(5)
+    imgui.PopStyleVar(4)
+end)
+
+imgui.OnFrame(function() return false and showToolButton[0] end, function(self)
+    self.HideCursor = false
+    local W, H = toolW[0], toolH[0]
+    local GROUP_W = W + H + 4 * S
+    local io = imgui.GetIO()
+    if toolDrag then
+        if imgui.IsMouseDown(0) then
+            toolX[0] = math.floor(io.MousePos.x - toolOx)
+            toolY[0] = math.floor(io.MousePos.y - toolOy)
+            toolX[0] = math.max(0, math.min(sizeX - GROUP_W, toolX[0]))
+            toolY[0] = math.max(0, math.min(sizeY - H, toolY[0]))
+        else
+            toolDrag = false; toolHold = 0; mark(); saveCfg()
+        end
+    end
+    imgui.SetNextWindowPos(V2(toolX[0], toolY[0]), imgui.Cond.Always)
+    imgui.SetNextWindowSize(V2(GROUP_W, H), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, H * 0.22)
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, H * 0.20)
     imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
     imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(0, 0))
     imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(0, 0))
-    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.025, 0.075, 0.095, 0.98))
-    imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.075, 0.095, 0.0))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.05, 0.25, 0.29, 0.28))
-    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.06, 0.35, 0.40, 0.42))
-    imgui.PushStyleColor(imgui.Col.Text, V4(0.82, 0.98, 1.00, 1.00))
-    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize
-    imgui.Begin("##taxi_map_button", nil, flags)
-    local label = u8"МИНИ-КАРТА"
-    local hit = imgui.Button("##taxi_map_toggle", V2(W, H))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0, 0, 0, 0))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.025, 0.075, 0.095, 0.98))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.05, 0.25, 0.29, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.06, 0.35, 0.40, 1.0))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.88, 0.98, 0.95, 1.00))
+    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoBackground
+    imgui.Begin("##rh_tool_toggle_group", nil, flags)
+
+    local hit = imgui.Button("##rh_tool_button", V2(W, H))
     local p1, p2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
     local dl = imgui.GetWindowDrawList()
+    local label = autoTool[0] and u8"ИНСТРУМЕНТ: ВКЛ" or u8"ИНСТРУМЕНТ: ВЫКЛ"
     local textSize = imgui.CalcTextSize(label)
-    local textX = p1.x + (W - textSize.x) * 0.5
     local centerY = (p1.y + p2.y) * 0.5
+    local color = autoTool[0] and 0xFF55E6A8 or 0xFFB9C5D0
     pcall(function()
-        dl:AddRect(p1, p2, 0x66DCBE37, H * 0.5, 0, 4 * S)
-        dl:AddRect(p1, p2, 0xFFDCBE37, H * 0.5, 0, 1.8 * S)
-        dl:AddText(V2(textX, centerY - imgui.GetFontSize() * 0.5), 0xFFFFD166, label)
+        dl:AddRect(p1, p2, autoTool[0] and 0xFF43D69A or 0xFF657487, H * 0.22, 0, 1.7 * S)
+        dl:AddText(V2(p1.x + (W - textSize.x) * 0.5, centerY - imgui.GetFontSize() * 0.5), color, label)
     end)
-    if imgui.IsItemActive() and not mapBtnDrag then
-        mapBtnHold = mapBtnHold + io.DeltaTime
-        if mapBtnHold >= HOLD then
-            mapBtnDrag = true
-            mapBtnSuppressClick = true
-            mapBtnOx = io.MousePos.x - mapBtnX[0]
-            mapBtnOy = io.MousePos.y - mapBtnY[0]
+    if imgui.IsItemActive() and not toolDrag then
+        toolHold = toolHold + io.DeltaTime
+        if toolHold >= HOLD then
+            toolDrag = true
+            toolOx = io.MousePos.x - toolX[0]
+            toolOy = io.MousePos.y - toolY[0]
         end
-    elseif not imgui.IsItemActive() and not mapBtnDrag then
-        mapBtnHold = 0
+    elseif not imgui.IsItemActive() and not toolDrag then
+        toolHold = 0
     end
-    if hit and not mapBtnDrag then
-        if not mapBtnSuppressClick and mapBtnHold < HOLD then
-            taxiMapWindow[0] = not taxiMapWindow[0]
+    if hit and not toolDrag and toolHold < HOLD then toolSetEnabled(not autoTool[0]) end
+
+    imgui.SameLine(0, 4 * S)
+    local skipHit = imgui.Button("##rh_tool_skip", V2(H, H))
+    local q1, q2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    pcall(function()
+        dl:AddRect(q1, q2, 0xFF4A91C8, H * 0.20, 0, 1.7 * S)
+        local cx, cy = (q1.x + q2.x) * 0.5, (q1.y + q2.y) * 0.5
+        local arm = H * 0.18
+        dl:AddLine(V2(cx - arm * 0.45, cy - arm), V2(cx + arm * 0.45, cy), 0xFFEAF5FF, 3 * S)
+        dl:AddLine(V2(cx + arm * 0.45, cy), V2(cx - arm * 0.45, cy + arm), 0xFFEAF5FF, 3 * S)
+    end)
+    if skipHit then
+        if autoTool[0] and toolStage and not toolNeedsManualTake then
+            toolLastHitAt = 0
+            toolAdvanceAfterHit()
+            sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Этап пропущен. Текущий этап: " .. (TOOL_ITEMS[toolStage] and TOOL_ITEMS[toolStage].name or "—"), -1)
+        else
+            sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Нельзя пропустить этап: включите инструмент и дождитесь распознавания этапа либо возьмите первый инструмент вручную.", -1)
         end
-        mapBtnSuppressClick = false
     end
+
     imgui.End()
     imgui.PopStyleColor(5)
     imgui.PopStyleVar(5)
 end)
 
+imgui.OnFrame(function() return false and showRep[0] end, function(self)
+    self.HideCursor = false
+    local W, H = repW[0], repH[0]
+    local io = imgui.GetIO()
+    if rdrag then
+        if imgui.IsMouseDown(0) then
+            repX[0] = math.floor(io.MousePos.x - rox)
+            repY[0] = math.floor(io.MousePos.y - roy)
+            if repX[0] < 0 then repX[0] = 0 end
+            if repY[0] < 0 then repY[0] = 0 end
+            if repX[0] > sizeX - W then repX[0] = sizeX - W end
+            if repY[0] > sizeY - H then repY[0] = sizeY - H end
+        else
+            rdrag = false
+            rhold = 0
+            mark()
+            saveCfg()
+        end
+    end
+    imgui.SetNextWindowPos(V2(repX[0], repY[0]), imgui.Cond.Always)
+    imgui.SetNextWindowSize(V2(W, H), imgui.Cond.Always)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 12 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 10 * S)
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, V2(0, 0))
+    imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V2(0, 0))
+    imgui.PushStyleColor(imgui.Col.WindowBg, V4(0.035, 0.095, 0.13, 0.98))
+    imgui.PushStyleColor(imgui.Col.Button, V4(0.035, 0.095, 0.13, 0.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.08, 0.25, 0.30, 0.30))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, V4(0.10, 0.34, 0.40, 0.42))
+    imgui.PushStyleColor(imgui.Col.Text, V4(0.85, 0.97, 0.99, 1.00))
+    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoResize
+    imgui.Begin("##rep", nil, flags)
+    local hit = imgui.Button("##rh_location_button", V2(W, H))
+    local p1, p2 = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+    local dl = imgui.GetWindowDrawList()
+    local label = u8"МЕСТО"
+    local textSize = imgui.CalcTextSize(label)
+    local pinSize = 18 * S
+    local groupW = pinSize + 9 * S + textSize.x
+    local groupX = p1.x + (W - groupW) * 0.5
+    local centerY = (p1.y + p2.y) * 0.5
+    local pinX = groupX + pinSize * 0.5
+    local pinY = centerY - 2 * S
+    pcall(function()
+        dl:AddRect(p1, p2, 0xFFC2AF38, 12 * S, 0, 1.6 * S)
+        dl:AddTriangleFilled(V2(pinX - pinSize * 0.43, pinY - pinSize * 0.10), V2(pinX + pinSize * 0.43, pinY - pinSize * 0.10), V2(pinX, pinY + pinSize * 0.62), 0xFFE5D655)
+        dl:AddCircleFilled(V2(pinX, pinY - pinSize * 0.12), pinSize * 0.43, 0xFFE5D655, 20)
+        dl:AddCircleFilled(V2(pinX, pinY - pinSize * 0.12), pinSize * 0.16, 0xFF3B2F20, 16)
+        dl:AddText(V2(groupX + pinSize + 9 * S, centerY - imgui.GetFontSize() * 0.5), 0xFFF8F6D9, label)
+    end)
+    if imgui.IsItemActive() and not rdrag then
+        rhold = rhold + io.DeltaTime
+        if rhold >= HOLD then
+            rdrag = true
+            rox = io.MousePos.x - repX[0]
+            roy = io.MousePos.y - repY[0]
+        end
+    elseif not imgui.IsItemActive() and not rdrag then
+        rhold = 0
+    end
+    if hit and not rdrag and rhold < HOLD then
+        repairsAt = 0
+        openRepairs()
+    end
+    imgui.End()
+    imgui.PopStyleColor(5)
+    imgui.PopStyleVar(5)
+end)
 
 
 local function drawMiniStatRow(label, value, valueColor)
@@ -2922,9 +4396,13 @@ imgui.OnFrame(function() return showStats[0] end, function(self)
     if visMoney[0] then
         drawMiniStatRow("Заработано", fmtMoney(st.money), V4(0.96, 0.73, 0.24, 1.00))
     end
-    drawMiniStatRow("Завершено заказов", tostring(TAXI_STATS.sessionDone), V4(0.96, 0.73, 0.24, 1.00))
-    drawMiniStatRow("Опыт", tostring(TAXI_STATS.expCur or "—") .. " / " .. tostring(TAXI_STATS.expNeed or "—"), V4(0.96, 0.73, 0.24, 1.00))
-    drawMiniStatRow("До уровня", tostring(TAXI_EXP_REMAINING() or "—"), V4(0.96, 0.73, 0.24, 1.00))
+    if visFrame[0] then
+        drawMiniStatRow("Завершено заказов", tostring(TAXI_STATS.sessionDone), V4(0.96, 0.73, 0.24, 1.00))
+    end
+    if visChests[0] then
+        drawMiniStatRow("Опыт", tostring(TAXI_STATS.expCur or "—") .. " / " .. tostring(TAXI_STATS.expNeed or "—"), V4(0.96, 0.73, 0.24, 1.00))
+        drawMiniStatRow("До уровня", tostring(TAXI_EXP_REMAINING() or "—"), V4(0.96, 0.73, 0.24, 1.00))
+    end
 
     imgui.End()
     imgui.PopStyleColor(6)
@@ -2935,29 +4413,19 @@ end)
 
 function main()
     while not isSampAvailable() do wait(100) end
+    -- Новый файл журнала на каждый запуск скрипта; reconnect-сессии дописываются ниже.
+    logInit()
     loadCfg()
+-- Legacy Road Helper automation is intentionally hidden/disabled in Taxi Helper UI.
+autoClick[0], autoCaptcha[0], autoTool[0], autoRepairs[0] = false, false, false, false
+showRep[0], showToolButton[0] = false, false
+
     TAXI_LOAD_CFG()
     TAXI_SET_ENABLED(false)
     TAXI_SET_AUTO_ACCEPT(true)
+    if autoTool[0] then toolNeedsManualTake = true; toolStage = nil end
     sampRegisterChatCommand("th", toggleMenu)
-    sampRegisterChatCommand("threset", function()
-        if type(TAXI_RESET_SESSION) == "function" then
-            TAXI_RESET_SESSION()
-        else
-            moneySessionGen = moneySessionGen + 1
-            st.money = 0
-            elapsedWork = 0
-            t0 = working and os.time() or 0
-            lastMoney = -1
-            moneyBaselinePending = true
-            moneyBaselineHits = 0
-            moneyBaselineCandidate = nil
-            moneyResetGuardUntil = os.clock() + 3.0
-            saveCfg()
-            sampAddChatMessage("{00CCB3}[Taxi Helper] {FFFFFF}Статистика сессии сброшена: $0", -1)
-        end
-    end)
-    sampAddChatMessage("{E6B33D}[Taxi Helper] Загружен. /th | /threset | v" .. VER, -1)
+    sampAddChatMessage("{E6B33D}[Taxi Helper] Загружен. /th | v" .. VER, -1)
 
     local moneyAt = 0
     local wasSampAvailable = true
@@ -2972,57 +4440,73 @@ function main()
         taxiWasEnabled = working and taxiCatch[0]
         TAXI_TICK(os.clock())
 
+        if toolRollerWaitAt > 0 and (os.clock() - toolRollerWaitAt) >= TOOL_ROLLER_MENU_TIMEOUT then
+            toolRollerWaitAt = 0
+            toolStage = nil
+            toolNeedsManualTake = false
+            toolButtonGeneration = toolButtonGeneration + 1
+            toolQueueBusy = false
+            sampAddChatMessage("{FFCC55}[ИНСТРУМЕНТ] {FFFFFF}Меню не открывалось 5 минут после взятия катка. Этап сброшен — ожидаю сообщение сервера или первое ручное взятие.", -1)
+        end
+
+        if toolTrunkFlag then
+            toolTrunkFlag = false
+            if autoTool[0] and not toolNeedsManualTake then
+                toolStartQueue()
+            elseif autoTool[0] and toolNeedsManualTake then
+                sampAddChatMessage("{00DDBB}[ИНСТРУМЕНТ] {FFFFFF}Жду сообщение сервера об этапе или первое ручное взятие инструмента.", -1)
+            end
+        end
+
         local sampAvailable = isSampAvailable()
         if wasSampAvailable and not sampAvailable then
             -- При выходе с сервера сбрасываем только таймер; накопленная статистика остаётся.
             elapsedWork = 0
             t0 = 0
             working = false
+            RH_ORDER.pending = nil
+            RH_ORDER.dialogOpen = false
+            RH_ORDER.processing = false
             TAXI_CLEAR(1.0, 'server disconnected')
+            clicker = false
+            toolRollerWaitAt = 0
+            if autoTool[0] then
+                toolStage = nil
+                toolNeedsManualTake = true
+                toolButtonGeneration = toolButtonGeneration + 1
+                toolQueueBusy = false
+            end
+            pendingLoot = nil
             autoFillGeneration = autoFillGeneration + 1
             gasState = { gasType = nil, maxGas = nil, currentGas = nil }
             lastMoney = -1
-            moneyBaselinePending = true
-            moneyBaselineHits = 0
-            moneyBaselineCandidate = nil
-            moneySessionGen = moneySessionGen + 1
         end
         wasSampAvailable = sampAvailable
+
+        -- Автокликер и ремонтные функции удалены из Taxi Helper.
 
         if working then
             local now = os.clock()
             if now - moneyAt >= 0.25 then
                 moneyAt = now
-                local money = readTaxiPlayerMoney()
+                local money = readCurrentPlayerMoney()
                 if money ~= nil then
-                    local gen = moneySessionGen
-                    -- Пока идёт установка базы: копим одинаковые чтения, в st.money ничего не пишем.
-                    if moneyBaselinePending or lastMoney < 0 or now < moneyResetGuardUntil then
-                        if moneyBaselineCandidate == money then
-                            moneyBaselineHits = moneyBaselineHits + 1
-                        else
-                            moneyBaselineCandidate = money
-                            moneyBaselineHits = 1
-                        end
+                    if moneyResetPending then
+                        -- Первая успешная выборка после сброса — новая точка
+                        -- отсчёта. Старый прирост никогда не прибавляется.
                         lastMoney = money
-                        -- 3 одинаковых чтения или аварийный таймаут, если API «прыгает».
-                        if now >= moneyResetGuardUntil and (
-                            moneyBaselineHits >= MONEY_BASELINE_NEED
-                            or now >= (moneyResetGuardUntil + 2.0)
-                        ) then
-                            moneyBaselinePending = false
-                            lastMoney = money
-                        end
-                    elseif money > lastMoney then
-                        local delta = money - lastMoney
-                        -- Типичный заказ такси не даёт десятки миллионов за один тик.
-                        if gen == moneySessionGen and delta > 0 and delta < 2000000 then
-                            st.money = st.money + delta
-                            mark()
-                        end
+                        moneyResetPending = false
+                    elseif now < moneyResetGuardUntil then
+                        -- Во время защитного окна только обновляем базовый
+                        -- баланс, не записывая его изменение в заработок.
+                        lastMoney = money
+                    elseif lastMoney == -1 then
                         lastMoney = money
                     else
-                        -- Траты/штрафы сдвигают базу вниз, заработок сессии не уменьшаем.
+                        -- Баланс используется только как контрольная точка.
+                        -- Заработок Taxi Helper начисляется по серверному
+                        -- сообщению «[Такси] Клиент оплатил», чтобы одна выплата
+                        -- не дублировалась одновременно чатом и изменением баланса.
                         lastMoney = money
                     end
                 end
